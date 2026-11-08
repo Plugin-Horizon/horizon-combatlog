@@ -1,0 +1,10 @@
+horizon-combatlog
+
+This mod is derived from CombatLog 1.20 by Nikey (https://github.com/NikeyV1/CombatLog),
+licensed under the GNU General Public License v3.0. The original copyright notice:
+
+    Copyright (c) 2026 Nikey
+
+The port (the mod's code, and the combatlog-core crate) is a derived work of that
+source and is therefore distributed under the same licence, GPL-3.0; see LICENSE.
+Copyright of the port's additions: horizon-combatlog contributors (Detimes).

@@ -1,0 +1,12 @@
+[package]
+name = "mod-combatlog"
+version = "0.2.0"
+license = "GPL-3.0-only"
+edition = "2024"
+
+[dependencies]
+# The launcher points this at the Horizon source it builds the game from. Needs the hooks-all
+# branch (player_logging_out, player_hurt_by_player) until those hooks are merged upstream.
+horizon-client = { git = "https://github.com/horizon-rust/horizon", rev = "69fab597a6f0e8a6ce524d38d1b73e599e343034" }
+# The logic, without game types (tested on its own: `cd core && cargo test`).
+combatlog-core = { path = "core" }
