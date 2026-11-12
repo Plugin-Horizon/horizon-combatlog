@@ -2,7 +2,7 @@ id = "combatlog"
 name = "CombatLog"
 version = "0.2.0"
 description = "Combat tagging: a tagged player who logs out dies, Mending and some teleports are refused while tagged, /combatlog for operators."
-authors = ["CoreSMP"]
+authors = ["Plugin-Horizon contributors"]
 api = "0.2"
 capabilities = ["registries"]
 
