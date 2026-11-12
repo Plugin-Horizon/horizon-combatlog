@@ -1,10 +1,20 @@
 # horizon-combatlog
 
-> **Unofficial Rust port of CombatLog for the Horizon server (https://github.com/horizon-rust/horizon). Not affiliated with or endorsed by the CombatLog authors.**
+> **Unofficial Rust port of CombatLog for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the CombatLog authors.**
 
-Combat tagging for [Horizon](https://github.com/horizon-rust/horizon) servers, as a native trait mod
+Combat tagging for [Horizon](https://github.com/arismoko/horizon) servers, as a native trait mod
 (`docs/native-mods.md`, "Trait mods"). Derived from **CombatLog 1.20** by Nikey (https://github.com/NikeyV1/CombatLog,
 GPL-3.0; `de.nikey`, Bukkit/Paper plugin, `plugin.yml` `api-version: 26.3`). Not affiliated with its author.
+
+> **Built for and working only with [arismoko/horizon](https://github.com/arismoko/horizon)** (the Horizon fork that carries the mod API). [horizon-rust/horizon](https://github.com/horizon-rust/horizon) is experimental for mods and not supported: the earlier version for its native hooks / horizon-mixins is frozen on the `horizon-plain` branch (work stopped on 2026-11-12).
+
+## Which Horizon
+
+This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `horizon-mod-api`, `src/lib.rs` with the hooks, and the plugin logic in the `core/` crate (plain Rust, no engine needed for its tests).
+
+- Pin: `[native] horizon = "54090ee36c4e2c7b43b66db864220c577b94b7e0"` in `horizon-mod.toml` (game `26.3`). That is a development build of arismoko/horizon `main` plus mod API additions that are not all merged upstream yet, so a stock `main` may lack some host methods this mod calls until they land.
+- It compiled and loaded on that build and was smoke-tested there; it has not seen a long run with real players. Treat it as experimental.
+- Feature descriptions below were written for the earlier horizon-rust version; where they name engine calls (`native_*`) or old file paths, read them as descriptions only. The Known gaps list is current.
 
 ## What it does
 
@@ -56,25 +66,6 @@ The shipped defaults differ from the values the original ran with on its server:
 the explosion trigger and anti-kill-abuse were off and logout was `kill`. A server that wants that behaviour copies those
 values into its config. Note: the shipped default of anti-kill-abuse is enabled and runs `ban`, so check it before going live.
 
-## Build
-
-A trait mod. Build it with the Horizon launcher (`horizon-launcher native-build <this folder> --server-output DIR
---version TAG --trust-native-code`) or by hand as the launcher does: put `api/` into the exported Horizon workspace,
-point its `horizon-client` dependency at the workspace crate, and link `mod_combatlog::hooks()` into the game
-executable. The bundle is pinned to the Horizon commit in `horizon-mixin.toml`.
-
-The logic lives in its own crate, `api/core` (`combatlog-core`: serde and toml only, no game types), so its unit tests
-run without Horizon: `cd api/core && cargo test`. The `api` crate is the glue to the hooks.
-
-## Licence and origin
-
-GPL-3.0, see `LICENSE`; the original's copyright notice is in `NOTICE`.
-
-This mod is a port of CombatLog 1.20 (https://github.com/NikeyV1/CombatLog, GPL-3.0, Copyright (c) 2026 Nikey) and is
-therefore a derived work under the same licence. Until this revision the port was a clean-room rebuild from the plugin.yml
-and config; the logic since then follows the original's source code (`src/main/java/de/nikey/combatLog`, upstream commit
-18c0fd1a0dbdd574f7c3651539126941d06fcf31) and is no longer clean room.
-
 ## Choices that are ours (the original may differ)
 
 - A hit is any damage one player's attack or projectile does to another (the engine's "incoming damage" event).
@@ -102,55 +93,30 @@ and config; the logic since then follows the original's source code (`src/main/j
 - `commands.combatlog.no-permission`: the engine refuses `/combatlog` to non-operators itself; the original's message is not sent.
 - The AFK title (`afk-title`): it belongs to an AFK plugin's state, which Horizon has no hook for.
 
-## Proof (Horizon `69fab597a`, throwaway dedicated server, protocol clients, unmodded engine vs. engine with the mod)
+## Build
 
-| Trigger | Unmodded | With the mod |
-|---|---|---|
-| Player A hits player B | no action bar | both get a red `15/15`, `14/15`, ... on the action bar |
-| B runs `tpa` while tagged | `Unknown or incomplete command` | `You can't use this command in combat`, health 19 -> 14 |
-| B runs `list` while tagged | works | works |
-| Mending while tagged (sword damage 500) | repaired (496) | not repaired (500), the experience becomes points |
-| Mending after the 15 s ran out | repaired | repaired |
-| Tagged B disconnects, then joins again | alive, items kept | server log `B has combat logged!`; on the next join B dies (`death.attack.genericKill`) and the 5 diamonds drop |
-| Untagged player disconnects, joins again | alive | alive (20 health) |
-| B dies while A is tagged | n/a | A's countdown stops |
-| Config saved while running | n/a | `config reloaded`; an invalid value keeps the old config |
+Build it as a native trait mod with arismoko's launcher (see the "native mods" how-to in the arismoko/horizon docs):
 
-Unit tests (`cargo test`): tagging modes, renewal, expiry, untag-on-kill (this found a real ordering bug), exempt players,
-command matching, config defaults and parsing, colour codes.
+```sh
+horizon-launcher native-build <path to this folder> --server-output <dir> --version <tag> --trust-native-code
+```
 
-## Not proven
+`--trust-native-code` is your consent to compile and run this code inside the server. The logic crate tests run without the engine: `(cd core && cargo test)`.
 
-Everything added in 0.2.0 (see "What it does") is unbuilt and unproven: the glue in `api/src/lib.rs` was written
-against the hook catalog of the pinned revision without compiling it. Only the logic in `api/core` has run (its unit
-tests). In particular unproven: that the vanilla `/bossbar` command reaches a dedicated server's clients, that a
-teleport ends a riptide launch, and the exact field names of the generated event structs.
+## Known gaps
 
-- Projectile hits (bow, trident, snowball): the engine does not let a player's projectile hurt another player yet, so only
-  melee was exercised. The mod also listens to the engine's incoming-damage event, which would cover projectiles.
-- `logout-mode = "commands"`, `tag-mode` attacker/victim, `start-below-health`, whitelist mode and operator exemption are
-  covered by unit tests of the logic only, not on a server.
-- Ignored dimensions and a kicked player (a kick counts as combat logging, as in the original) are not exercised on a server.
-- This revision's changes (per-victim kill abuse, killer-only untag, blocked commands without damage, effects cleared and
-  renewed, the health threshold for fights already on, `/combatlog status|untag` usage lines) were not compiled or run:
-  no `cargo` was run for them.
-- The mod was built by hand into the exported Horizon workspace the way the launcher does it, not with the launcher itself.
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-## What the engine does not offer yet (workarounds in the mod)
+- Mending cannot be refused in combat (`restrictions.mending.disabled_in_combat` is not applied): arismoko moved Mending to an item part a trait mod cannot veto.
+- A refused elytra glide cannot be stopped; the player only gets the message and the penalty.
+- There is no hook before a player leaves, so a tagged logout is punished after they left: the kill waits for their next join, the commands and the announcement run at once.
+- Hits that the health check or invulnerability left at zero are not heard.
 
-- (Solved with hooks-all) `player_logging_out` kills a tagged player while they are still in their level, so the drops
-  land where they logged out; the next-join kill stays only as a fallback.
-- (Solved with hooks-all) `player_hurt_by_player` names attacker and victim for melee, sweep and projectiles past the
-  pvp rule, teams and invulnerability, so the `attack_entity` + health-drop guess is gone. Hits are still resolved at
-  the next tick (the hook has no host).
-- `entity_toggle_glide` only listens: a cancellable glide start (or a `stop_gliding(uuid)` helper) is needed to really
-  refuse the elytra.
-- `player_teleported` only listens, after the move: a cancellable command-teleport hook would replace the move back.
-- `player_riptide` only listens, after the velocity is applied, and `entity_set_velocity` refuses players: a cancellable
-  riptide hook (or a player velocity helper) would replace the teleport.
-- No boss bar helper: the timer goes through `/bossbar`, whose bars are saved with the world (a crash leaves one
-  behind until `/bossbar remove`). A per-player boss bar helper would avoid both.
+## Licence and origin
 
-## Contributing
+GPL-3.0, see `LICENSE`; the original's copyright notice is in `NOTICE`.
 
-Pull requests and improvements are always welcome! Open an issue or a PR -- direct pushes to main are disabled, every change goes through review.
+This mod is a port of CombatLog 1.20 (https://github.com/NikeyV1/CombatLog, GPL-3.0, Copyright (c) 2026 Nikey) and is
+therefore a derived work under the same licence. Until this revision the port was a clean-room rebuild from the plugin.yml
+and config; the logic since then follows the original's source code (`src/main/java/de/nikey/combatLog`, upstream commit
+18c0fd1a0dbdd574f7c3651539126941d06fcf31) and is no longer clean room.

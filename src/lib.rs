@@ -1,10 +1,10 @@
-//! CombatLog for Horizon: a trait mod (docs/native-mods.md, "Trait mods").
+//! CombatLog as an arismoko native trait mod (`mod_api`). The logic is the unchanged
+//! `combatlog-core` crate (`core/`); this file maps its hooks and calls onto arismoko's API.
+//! Gaps and stand-ins are listed in PORT_NOTES.md and marked `TODO(arismoko-api: ...)` below.
 //!
 //! Hitting a player tags both sides for a while; a tagged player's logout kills them, their
 //! Mending repairs nothing and the commands on the list are refused with a damage penalty.
-//! Optional (off by default): elytra, teleport and riptide restrictions, a boss bar timer,
-//! effects on tag, anti-kill-abuse. `/combatlog reload|status|untag` for operators.
-//! The logic lives in `combatlog-core` (`core/`); this file is only the glue to the hooks.
+//! Config: `config/combatlog-common.toml`, re-read when it changes. `/combatlog reload|status|untag`.
 use combatlog_core::abuse::KillLog;
 use combatlog_core::admin::{self, Admin};
 use combatlog_core::cmds;
@@ -12,31 +12,42 @@ use combatlog_core::combat::{PlayerId, Tagger, effective_mode};
 use combatlog_core::config::{Config, DEFAULT_TOML, Display, LogoutMode};
 use combatlog_core::restrict::{self, Action, Guard};
 use combatlog_core::text;
-use horizon_client::mod_api::{
-    ChorusFruitTeleportEvent, ConfigLoadingEvent, ConfigReloadingEvent, EnderPearlTeleportEvent,
-    EntityToggleGlideEvent, Flow, Hooks, Host, MendingRepairEvent, NativeCommand, NativeConfig,
-    NativeConfigKind, NativeServerPlayer, PerformCommandEvent, PlayerCommandEvent,
-    PlayerDiedEvent, PlayerHurtByPlayerEvent, PlayerKickedEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerLoggingOutEvent, PlayerRiptideEvent, PlayerTeleportEndGatewayEvent,
-    PlayerTeleportedEvent, RegisterCommandsEvent, RegisterConfigsEvent, ServerStoppingEvent, Text,
-    TickEvent,
+use mod_api::{
+    Command, CommandArgumentValue, Config as NativeConfig, ConfigKind, ConfigLoadingEvent,
+    ConfigReloadingEvent, EnderPearlTeleportEvent, EntityToggleGlideEvent, Flow, GameMode,
+    HostSide, Hooks, ItemConsumptionTeleportEvent, LevelRandomHost, LivingDamagePostEvent,
+    PlayerCommandEvent, PlayerDiedEvent, PlayerDisconnectedEvent,
+    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRiptideEvent, QuitReason,
+    PlayerTeleportEndGatewayEvent, PlayerTeleportedEvent, RegisterCommandsEvent,
+    RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent,
+    ServerTickPhase, Text,
 };
+use mod_api::text::TextStyle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 const MOD_ID: &str = "combatlog";
-/// The file `NativeConfigKind::Common` keeps for this mod in the config folder.
-const CONFIG_FILE: &str = "combatlog-common.toml";
+/// The file the game keeps for this mod in the config folder (`/combatlog reload` re-reads it).
+const CONFIG_PATH: &str = "config/combatlog-common.toml";
 
-pub fn hooks() -> Box<dyn Hooks> {
-    Box::new(CombatLog {
-        state: Mutex::new(State::default()),
-    })
-}
-
+#[derive(Default)]
 struct CombatLog {
     state: Mutex<State>,
+}
+
+/// What the last tick saw of a player: some hooks cannot reach the player list.
+#[derive(Clone)]
+struct Seen {
+    uuid: PlayerId,
+    /// The entity id the hurt and attack hooks carry.
+    entity: u32,
+    name: String,
+    permission: u8,
+    dimension: String,
+    position: [f64; 3],
+    game_mode: i32,
+    health: f32,
 }
 
 #[derive(Default)]
@@ -45,15 +56,16 @@ struct State {
     tagger: Tagger,
     guard: Guard,
     kills: KillLog,
-    /// (attacker, victim) of player-on-player damage that went through (`player_hurt_by_player`
-    /// past the pvp rule, teams and invulnerability, amount above zero), resolved at the next
-    /// tick: the damage hook has no host to look the players up with.
-    hits: Vec<(PlayerId, PlayerId)>,
-    /// Players whose logout was already handled by `player_logging_out` (still in their level).
+    /// (attacker, victim) entity ids of a living hit that took health and had an attacker
+    /// (`living_damage_post`), resolved at the next tick against the player list: a fight
+    /// counts only between two players, teams and invulnerability as the original.
+    hits: Vec<(u32, u32)>,
+    /// Players whose logout was already handled by a logging-out hook (still in their level).
+    /// Empty on arismoko: there is no such hook yet, see `player_logged_out`.
     left: BTreeSet<PlayerId>,
     /// The players as the last tick saw them: player hooks may run while the player list is out
     /// of reach, so they look players up here.
-    players: Vec<NativeServerPlayer>,
+    players: Vec<Seen>,
     /// Players tagged outside the tick (a landing ender pearl): their tag start is handled there.
     fresh: BTreeSet<PlayerId>,
     /// Players whose timer is a boss bar.
@@ -78,7 +90,7 @@ struct State {
 
 impl State {
     /// Reads the owed kills once the world is open.
-    fn load_owed(&mut self, host: &dyn Host) {
+    fn load_owed(&mut self, host: &dyn ServerHost) {
         if self.owed_loaded {
             return;
         }
@@ -117,15 +129,15 @@ impl State {
         }
     }
 
-    fn exempt(&self, player: &NativeServerPlayer) -> bool {
+    fn exempt(&self, player: &Seen) -> bool {
         self.cfg.bypasses(player.permission) || self.cfg.dimension_ignored(&player.dimension)
     }
 
-    fn player(&self, id: PlayerId) -> Option<&NativeServerPlayer> {
+    fn player(&self, id: PlayerId) -> Option<&Seen> {
         self.players.iter().find(|p| p.uuid == id)
     }
 
-    fn named(&self, name: &str) -> Option<&NativeServerPlayer> {
+    fn named(&self, name: &str) -> Option<&Seen> {
         self.players
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case(name))
@@ -185,16 +197,80 @@ impl State {
     }
 }
 
+/// `Text::empty()` of the original: an empty literal.
+fn blank() -> Text {
+    Text::literal("")
+}
+
+/// The `&`-coded template as coloured segments (`TextStyle` takes `#RRGGBB`).
 fn legacy(template: &str) -> Text {
     text::segments(template)
         .into_iter()
-        .fold(Text::empty(), |all, (part, colour)| {
-            all.append(Text::colored(part, colour))
+        .fold(blank(), |all, (part, colour)| {
+            let mut style = TextStyle::default();
+            style.color = Some(format!("#{colour:06X}"));
+            all.append(Text::literal(part).with_style(style))
         })
+}
+
+/// The vanilla id of a game mode, as `/combatlog status` shows it.
+fn game_mode_id(mode: GameMode) -> i32 {
+    match mode {
+        GameMode::Survival => 0,
+        GameMode::Creative => 1,
+        GameMode::Adventure => 2,
+        GameMode::Spectator => 3,
+        _ => -1,
+    }
+}
+
+/// What the player list says about `player` now; None when a read fails (the player is gone).
+fn seen(host: &dyn ServerHost, player: PlayerRef) -> Option<Seen> {
+    let entity = player.entity();
+    Some(Seen {
+        uuid: player.uuid(),
+        entity: entity.id(),
+        name: player.name(host)?,
+        permission: player.permission_level(host)?,
+        dimension: player.dimension(host)?.to_string(),
+        position: entity.position(host)?,
+        game_mode: game_mode_id(player.game_mode(host)?),
+        // NOTE: a failed health read counts as 0, so a start threshold would tag such a player.
+        health: host
+            .living(entity)
+            .and_then(|living| living.health(host))
+            .unwrap_or(0.0),
+    })
+}
+
+/// The connected player with this UUID, through the player list.
+fn player_ref(host: &dyn ServerHost, id: PlayerId) -> Option<PlayerRef> {
+    host.players()
+        .server_players()
+        .into_iter()
+        .find(|p| p.uuid() == id)
+}
+
+fn tell(host: &mut dyn ServerHost, id: PlayerId, line: Text) {
+    if let Some(player) = player_ref(host, id) {
+        let _ = player.tell(host, line);
+    }
+}
+
+fn action_bar(host: &mut dyn ServerHost, id: PlayerId, line: Text) {
+    if let Some(player) = player_ref(host, id) {
+        let _ = player.action_bar(host, line);
+    }
 }
 
 fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The `/combatlog` usages as arismoko's command syntax: the player argument is a plain word
+/// (the lookup only finds online players, so a miss gets the "not found" answer).
+fn usage(line: &str) -> String {
+    line.replace("<player:player_name>", "<player:word>")
 }
 
 impl CombatLog {
@@ -224,28 +300,27 @@ impl CombatLog {
     }
 }
 
+#[mod_api::horizon_mod]
 impl Hooks for CombatLog {
-    fn register_configs(&self, _host: &mut dyn Host, event: &mut RegisterConfigsEvent<'_>) {
-        event.configs.push(NativeConfig::new(
-            MOD_ID,
-            NativeConfigKind::Common,
-            DEFAULT_TOML,
-        ));
+    fn register_configs(&self, _: HostSide, event: &mut RegisterConfigsEvent<'_>) {
+        event
+            .configs
+            .push(NativeConfig::new(MOD_ID, ConfigKind::Common, DEFAULT_TOML));
     }
 
-    fn config_loading(&self, _host: &mut dyn Host, event: &mut ConfigLoadingEvent<'_>) {
+    fn config_loading(&self, _: HostSide, event: &mut ConfigLoadingEvent<'_>) {
         if event.config.mod_id == MOD_ID {
             self.load_config(&event.config.text, "loaded");
         }
     }
 
-    fn config_reloading(&self, _host: &mut dyn Host, event: &mut ConfigReloadingEvent<'_>) {
+    fn config_reloading(&self, _: HostSide, event: &mut ConfigReloadingEvent<'_>) {
         if event.config.mod_id == MOD_ID {
             self.load_config(&event.config.text, "reloaded");
         }
     }
 
-    fn server_stopping(&self, host: &mut dyn Host, _event: &mut ServerStoppingEvent) {
+    fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         // Everyone "logs out" when the server stops; that is not combat logging. Boss bars are
         // saved with the world, so ours go now.
         let bars: Vec<PlayerId> = {
@@ -254,34 +329,51 @@ impl Hooks for CombatLog {
             std::mem::take(&mut st.bars).into_iter().collect()
         };
         for id in bars {
-            host.run_command(&cmds::bar_remove(id));
+            host.commands().run_command(&cmds::bar_remove(id));
         }
     }
 
-    fn player_hurt_by_player(&self, event: &mut PlayerHurtByPlayerEvent<'_>) -> Flow {
-        // A snowball or an egg is heard with amount 0 and hurts nobody: no tag, as before.
-        if event.amount > 0.0 && event.attacker != event.victim {
-            lock(&self.state).hits.push((event.attacker, event.victim));
+    /// Stands in for `player_hurt_by_player` (no such arismoko hook). Fires for every living hit
+    /// that took health, so the attacker and victim are matched to players at the next tick.
+    /// TODO(arismoko-api: player_hurt_by_player): the original also heard hits that the health
+    /// check or invulnerability left at zero; this hears only hits that took health.
+    fn living_damage_post(
+        &self,
+        _level: &mut dyn LevelRandomHost,
+        event: &mut LivingDamagePostEvent<'_>,
+    ) {
+        let attacker = event.source.causing;
+        let victim = event.entity;
+        if event.container.health_damage() > 0.0 && attacker > 0 && victim > 0 && attacker != victim
+        {
+            lock(&self.state).hits.push((attacker as u32, victim as u32));
         }
-        Flow::Continue
     }
 
-    fn tick(&self, host: &mut dyn Host, _event: &mut TickEvent) {
+    fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+        if !matches!(event.phase, ServerTickPhase::ServerTickStart { .. }) {
+            return;
+        }
         let mut bars: Vec<(PlayerId, Text)> = Vec::new();
         let mut clear: Vec<PlayerId> = Vec::new();
         let commands;
         let tells;
         {
             let mut st = lock(&self.state);
-            st.load_owed(host);
+            st.load_owed(&*host);
             st.ticks += 1;
             let ended = st.tagger.advance();
             let hits = std::mem::take(&mut st.hits);
             let mut fresh: BTreeSet<PlayerId> = std::mem::take(&mut st.fresh);
             let mut started: BTreeSet<PlayerId> = fresh.clone();
-            let players = host.server_players();
-            let find = |id: PlayerId| players.iter().find(|p| p.uuid == id);
-            let mut fights: Vec<(&NativeServerPlayer, &NativeServerPlayer)> = Vec::new();
+            let players: Vec<Seen> = host
+                .players()
+                .server_players()
+                .into_iter()
+                .filter_map(|p| seen(&*host, p))
+                .collect();
+            let find = |entity: u32| players.iter().find(|p| p.entity == entity);
+            let mut fights: Vec<(&Seen, &Seen)> = Vec::new();
             for (attacker, victim) in hits {
                 if let (Some(attacker), Some(victim)) = (find(attacker), find(victim)) {
                     fights.push((attacker, victim));
@@ -363,83 +455,101 @@ impl Hooks for CombatLog {
             commands = std::mem::take(&mut st.commands);
             tells = std::mem::take(&mut st.tells);
         }
-        bars.extend(clear.into_iter().map(|id| (id, Text::empty())));
+        bars.extend(clear.into_iter().map(|id| (id, blank())));
         for (id, line) in bars {
-            host.action_bar(id, line);
+            action_bar(host, id, line);
         }
         for (id, line) in tells {
-            host.tell(id, legacy(&line));
+            tell(host, id, legacy(&line));
         }
         for command in commands {
-            host.run_command(&command);
+            host.commands().run_command(&command);
         }
     }
 
-    fn player_command(&self, _host: &mut dyn Host, event: &mut PlayerCommandEvent<'_>) -> Flow {
+    fn player_command(&self, _host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
         let mut st = lock(&self.state);
         if !st.tagger.is_tagged(event.player) || !st.cfg.command_blocked(event.command) {
             return Flow::Continue;
         }
         // The original refuses a blocked command with the message only: no damage here.
+        // Replies go out as system chat; the player helpers reach nobody in this hook.
         event.replies.push(legacy(&st.cfg.combat_log.messages.blocked_command));
         Flow::Cancel
     }
 
-    fn mending_repair(&self, _host: &mut dyn Host, event: &mut MendingRepairEvent<'_>) {
-        let st = lock(&self.state);
-        if st.cfg.combat_log.restrictions.mending.disabled_in_combat && st.tagger.is_tagged(event.player) {
-            event.repair = 0;
-            eprintln!("[combatlog] mending refused to a player in combat");
-        }
-    }
+    // TODO(arismoko-api: mending_repair): upstream replaced the `mending_repair` hook with the item part
+    // `ItemPart::xp_repair_ratio` (1e5c9bb062), asked only for parts attached to the stack's item, so a trait mod
+    // can no longer refuse Mending to a player in combat. `restrictions.mending.disabled_in_combat` is not applied.
 
     fn ender_pearl_teleport(
         &self,
-        _host: &mut dyn Host,
+        host: &mut dyn ServerHost,
         event: &mut EnderPearlTeleportEvent<'_>,
     ) -> Flow {
+        // Only a player's pearl counts: the thrower is the acting player (a mob's pearl is not).
+        let Some(player) = host
+            .players()
+            .acting_player()
+            .filter(|p| p.entity() == event.owner)
+        else {
+            return Flow::Continue;
+        };
+        let id = player.uuid();
+        let name = player.name(&*host).unwrap_or_default();
         if matches!(
-            self.teleport_hook(event.player, event.name, Action::EnderPearl),
+            self.teleport_hook(id, &name, Action::EnderPearl),
             Flow::Cancel
         ) {
             return Flow::Cancel;
         }
         // The pearl trigger: a landing pearl starts (or renews) its thrower's tag.
+        let me = seen(&*host, player);
         let mut st = lock(&self.state);
         let t = &st.cfg.combat_log.triggers;
         if !t.enderpearl.set_combat_on_land {
             return Flow::Continue;
         }
         let only_renew = t.enderpearl.only_if_already_in_combat;
-        let exempt = st.player(event.player).is_none_or(|p| st.exempt(p));
+        let exempt = me.as_ref().is_none_or(|p| st.exempt(p));
         let ticks = st.cfg.duration_ticks();
         if !exempt {
-            if st.tagger.tag_alone(event.player, ticks, only_renew) {
-                st.fresh.insert(event.player);
+            if st.tagger.tag_alone(id, ticks, only_renew) {
+                st.fresh.insert(id);
             } else {
-                st.renew.insert(event.player);
+                st.renew.insert(id);
             }
         }
         Flow::Continue
     }
 
-    fn chorus_fruit_teleport(
+    fn item_consumption_teleport(
         &self,
-        _host: &mut dyn Host,
-        event: &mut ChorusFruitTeleportEvent<'_>,
+        host: &mut dyn ServerHost,
+        event: &mut ItemConsumptionTeleportEvent<'_>,
     ) -> Flow {
-        self.teleport_hook(event.player, event.name, Action::ChorusFruit)
+        // Chorus fruit (and the other `teleport_randomly` items) of a player; a fox is not one.
+        let consumer = event.consumer.entity();
+        let Some(player) = host
+            .players()
+            .acting_player()
+            .filter(|p| p.entity() == consumer)
+        else {
+            return Flow::Continue;
+        };
+        let name = player.name(&*host).unwrap_or_default();
+        self.teleport_hook(player.uuid(), &name, Action::ChorusFruit)
     }
 
     fn player_teleport_end_gateway(
         &self,
-        _host: &mut dyn Host,
+        _host: &mut dyn ServerHost,
         event: &mut PlayerTeleportEndGatewayEvent<'_>,
     ) -> Flow {
         self.teleport_hook(event.player, event.name, Action::EndGateway)
     }
 
-    fn player_teleported(&self, _host: &mut dyn Host, event: &mut PlayerTeleportedEvent<'_>) {
+    fn player_teleported(&self, _host: &mut dyn ServerHost, event: &mut PlayerTeleportedEvent<'_>) {
         // Heard after the move: a refused /tp is undone by moving the player back, into the
         // dimension the last tick saw them in.
         let mut st = lock(&self.state);
@@ -461,8 +571,9 @@ impl Hooks for CombatLog {
         );
     }
 
-    fn entity_toggle_glide(&self, _host: &mut dyn Host, event: &mut EntityToggleGlideEvent<'_>) {
-        // The engine only tells; it cannot stop the glide (see the README's engine gaps).
+    fn entity_toggle_glide(&self, _host: &mut dyn ServerHost, event: &mut EntityToggleGlideEvent<'_>) {
+        // TODO(arismoko-api: entity_toggle_glide_cancel): the engine only tells; the glide cannot
+        // be stopped, so a refused elytra only gets the message (and the penalty), as before.
         if !event.gliding {
             return;
         }
@@ -474,8 +585,13 @@ impl Hooks for CombatLog {
         }
     }
 
-    fn player_riptide(&self, host: &mut dyn Host, event: &mut PlayerRiptideEvent<'_>) {
-        let at = host.acting_player().filter(|p| p.uuid == event.player);
+    fn player_riptide(&self, host: &mut dyn ServerHost, event: &mut PlayerRiptideEvent<'_>) {
+        // The position the launch started from: the acting player's, as the original read it.
+        let at = host
+            .players()
+            .acting_player()
+            .filter(|p| p.uuid() == event.player)
+            .and_then(|p| seen(&*host, p));
         let mut st = lock(&self.state);
         let tagged = st.tagger.is_tagged(event.player);
         let now = st.ticks;
@@ -496,7 +612,7 @@ impl Hooks for CombatLog {
         );
     }
 
-    fn player_died(&self, host: &mut dyn Host, event: &mut PlayerDiedEvent<'_>) {
+    fn player_died(&self, host: &mut dyn ServerHost, event: &mut PlayerDiedEvent<'_>) {
         let mut clear = Vec::new();
         {
             let mut st = lock(&self.state);
@@ -510,7 +626,10 @@ impl Hooks for CombatLog {
                 let cfg = st.cfg.anti_kill_abuse.clone();
                 let now = st.ticks;
                 let name = st.player(killer).map(|p| p.name.clone());
-                let victim = st.player(event.player).map(|p| p.name.clone()).unwrap_or_default();
+                let victim = st
+                    .player(event.player)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
                 if st.kills.record(&cfg, killer, event.player, now)
                     && let Some(name) = name
                 {
@@ -522,53 +641,32 @@ impl Hooks for CombatLog {
             }
         }
         for id in clear {
-            host.action_bar(id, Text::empty());
+            action_bar(host, id, blank());
         }
     }
 
-    fn player_kicked(&self, _host: &mut dyn Host, event: &mut PlayerKickedEvent<'_>) {
-        lock(&self.state).kicked.insert(event.player);
-    }
-
-    /// The player is gone but still in their level: a tagged logout is punished now, so a kill
-    /// drops their items where they stood (`native_player_logging_out`).
-    fn player_logging_out(&self, host: &mut dyn Host, event: &mut PlayerLoggingOutEvent<'_>) {
-        let (announce, commands) = {
-            let mut st = lock(&self.state);
-            st.load_owed(host);
-            st.left.insert(event.player);
-            // A kick is a logout as well: the original's quit listener does not tell them apart.
-            if st.stopping || !st.tagger.is_tagged(event.player) {
-                return;
-            }
-            st.tagger.untag(event.player);
-            st.effects.remove(&event.player);
-            let commands: Vec<String> = match st.cfg.combat_log.punishment.logout.mode {
-                LogoutMode::None => Vec::new(),
-                LogoutMode::Kill => vec![format!("kill {}", event.name)],
-                LogoutMode::Commands => st
-                    .cfg.combat_log.punishment.logout.commands
-                    .iter()
-                    .map(|c| text::fill(c, &[("player", event.name)]))
-                    .collect(),
-            };
-            let announce = legacy(&text::fill(
-                &st.cfg.combat_log.messages.combat_log,
-                &[("player", event.name)],
-            ));
-            (announce, commands)
-        };
-        // Outside the lock: a kill here runs `player_died` at once.
-        for command in commands {
-            host.run_command(&command);
+    /// The quit reason, heard right after `player_logged_out` for the same player (so it cannot
+    /// change that hook's punishment). A kick is kept in `kicked`, as the kick hook kept it; the set
+    /// is still never read, as before.
+    fn player_disconnected(
+        &self,
+        _host: &mut dyn ServerHost,
+        event: &mut PlayerDisconnectedEvent<'_>,
+    ) {
+        let mut st = lock(&self.state);
+        st.kicked.remove(&event.player);
+        if event.reason == QuitReason::Kicked {
+            st.kicked.insert(event.player);
         }
-        host.broadcast(announce);
     }
 
-    fn player_logged_out(&self, host: &mut dyn Host, event: &mut PlayerLoggedOutEvent<'_>) {
+    /// TODO(arismoko-api: player_logging_out): arismoko has no hook before the player leaves, so a
+    /// tagged logout is punished here, after they left. The kill then waits for their next join
+    /// (the original's fallback, `logout-mode = "kill"`) and the commands and announcement run now.
+    fn player_logged_out(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
         let announce = {
             let mut st = lock(&self.state);
-            st.load_owed(host);
+            st.load_owed(&*host);
             st.guard.forget(event.player);
             if st.bars.remove(&event.player) {
                 st.commands.push(cmds::bar_remove(event.player));
@@ -580,7 +678,6 @@ impl Hooks for CombatLog {
             if handled || st.stopping || !was_tagged {
                 return;
             }
-            // Fallback for an engine without `player_logging_out`: the old next-join kill.
             match st.cfg.combat_log.punishment.logout.mode {
                 LogoutMode::None => {}
                 LogoutMode::Kill => {
@@ -589,7 +686,11 @@ impl Hooks for CombatLog {
                 }
                 LogoutMode::Commands => {
                     let commands: Vec<String> = st
-                        .cfg.combat_log.punishment.logout.commands
+                        .cfg
+                        .combat_log
+                        .punishment
+                        .logout
+                        .commands
                         .iter()
                         .map(|c| text::fill(c, &[("player", event.name)]))
                         .collect();
@@ -601,27 +702,37 @@ impl Hooks for CombatLog {
                 &[("player", event.name)],
             ))
         };
-        host.broadcast(announce);
+        let _ = host.messages().broadcast(announce);
     }
 
-    fn player_logged_in(&self, host: &mut dyn Host, event: &mut PlayerLoggedInEvent<'_>) {
+    fn player_logged_in(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
         let mut st = lock(&self.state);
-        st.load_owed(host);
+        st.load_owed(&*host);
         if st.owed.remove(&event.player).is_some() {
             st.save_owed();
             st.commands.push(format!("kill {}", event.name));
         }
     }
 
-    fn register_commands(&self, _host: &mut dyn Host, event: &mut RegisterCommandsEvent<'_>) {
-        let level = lock(&self.state).cfg.admin.min_permission;
-        for usage in admin::USAGES {
-            event.commands.push(NativeCommand::op(usage, level));
+    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+        let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
+        for line in admin::USAGES {
+            event.commands.push(Command::op(&usage(line), level));
         }
     }
 
-    fn perform_command(&self, host: &mut dyn Host, event: &mut PerformCommandEvent<'_>) -> Flow {
-        let Some(command) = admin::parse(event.command) else {
+    /// The `/combatlog` command (`perform_command` of the original).
+    fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+        if event.command.literals.first().map(String::as_str) != Some(admin::LABEL) {
+            return Flow::Continue;
+        }
+        // Rebuilt as the typed line the core parses: the literal path, then the player name.
+        let mut line = event.command.literals.join(" ");
+        if let Some(CommandArgumentValue::String(name)) = event.command.argument("player") {
+            line.push(' ');
+            line.push_str(name);
+        }
+        let Some(command) = admin::parse(&line) else {
             return Flow::Continue;
         };
         let mut clear = Vec::new();
@@ -629,10 +740,7 @@ impl Hooks for CombatLog {
             Admin::Usage => admin::usage(&lock(&self.state).cfg),
             Admin::SubUsage(which) => vec![admin::sub_usage(&lock(&self.state).cfg, which)],
             Admin::Reload => {
-                let text = host
-                    .config_dir()
-                    .ok()
-                    .and_then(|d| std::fs::read_to_string(d.join(CONFIG_FILE)).ok());
+                let text = std::fs::read_to_string(CONFIG_PATH).ok();
                 let ok = text.is_some_and(|t| self.load_config(&t, "reloaded"));
                 let st = lock(&self.state);
                 let m = &st.cfg.command_messages;
@@ -679,10 +787,10 @@ impl Hooks for CombatLog {
             }
         };
         for line in lines {
-            host.feedback(legacy(&line));
+            let _ = host.commands().feedback(legacy(&line));
         }
         for id in clear {
-            host.action_bar(id, Text::empty());
+            action_bar(host, id, blank());
         }
         Flow::Cancel
     }
