@@ -16,7 +16,7 @@ use mod_api::{
     Command, CommandArgumentValue, Config as NativeConfig, ConfigKind, ConfigLoadingEvent,
     ConfigReloadingEvent, EnderPearlTeleportEvent, EntityToggleGlideEvent, Flow, GameMode,
     HostSide, Hooks, ItemConsumptionTeleportEvent, LevelRandomHost, LivingDamagePostEvent,
-    PlayerCommandEvent, PlayerDiedEvent, PlayerDisconnectedEvent,
+    PlayerCommandEvent, PlayerCommandsSentEvent, PlayerDiedEvent, PlayerDisconnectedEvent,
     PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRiptideEvent, QuitReason,
     PlayerTeleportEndGatewayEvent, PlayerTeleportedEvent, RegisterCommandsEvent,
     RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent,
@@ -267,6 +267,24 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// plugin.yml: `combatlog.admin`, default op. A sender without it gets Bukkit's permission message.
+const ADMIN_NODE: &str = "combatlog.admin";
+const NO_PERMISSION: &str = "I'm sorry, but you do not have permission to perform this command. Please contact the server administrators if you believe that this is in error.";
+
+/// Whether a typed line runs `/combatlog` (the label, or `combatlog:combatlog`).
+fn is_admin_command(line: &str) -> bool {
+    let root = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    root == admin::LABEL || root == format!("{0}:{0}", admin::LABEL)
+}
+
+/// The provider's answer for `combatlog.admin`, else the configured operator level (the engine's own check).
+fn may_admin(host: &dyn ServerHost, uuid: u128, level: u8) -> bool {
+    host.player(uuid).is_some_and(|p| {
+        let now = p.permission_level(host).unwrap_or(0);
+        p.permission_value(host, ADMIN_NODE).unwrap_or(now >= level)
+    })
+}
+
 /// The `/combatlog` usages as arismoko's command syntax: the player argument is a plain word
 /// (the lookup only finds online players, so a miss gets the "not found" answer).
 fn usage(line: &str) -> String {
@@ -467,8 +485,18 @@ impl Hooks for CombatLog {
         }
     }
 
-    fn player_command(&self, _host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
+    fn player_command(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
         let mut st = lock(&self.state);
+        // `/combatlog` is for `combatlog.admin` (the tree leaves it out for others; this answers the typed line).
+        if is_admin_command(event.command) {
+            let level = u8::try_from(st.cfg.admin.min_permission).unwrap_or(4);
+            if !may_admin(&*host, event.player, level) {
+                let mut style = TextStyle::default();
+                style.color = Some("#FF5555".to_string());
+                event.replies.push(Text::literal(NO_PERMISSION).with_style(style));
+                return Flow::Cancel;
+            }
+        }
         if !st.tagger.is_tagged(event.player) || !st.cfg.command_blocked(event.command) {
             return Flow::Continue;
         }
@@ -714,10 +742,21 @@ impl Hooks for CombatLog {
         }
     }
 
+    /// Tab list: `/combatlog` (and its sub-command names) leaves the tree of a player without `combatlog.admin`.
+    fn player_commands_sent(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandsSentEvent<'_>) {
+        let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
+        if !may_admin(&*host, event.player, level) {
+            event.names.retain(|n| {
+                let n = n.to_ascii_lowercase();
+                n != admin::LABEL && n != format!("{0}:{0}", admin::LABEL)
+            });
+        }
+    }
+
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
         for line in admin::USAGES {
-            event.commands.push(Command::op(&usage(line), level));
+            event.commands.push(Command::op(&usage(line), level).with_node(ADMIN_NODE));
         }
     }
 
