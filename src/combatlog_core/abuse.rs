@@ -2,8 +2,8 @@
 //! `remove-kill-after-seconds` is punished. Counts are per killer and victim pair, as in the
 //! original (`killHistory`: killer, then victim, then the kill times). Every kill is forgotten
 //! that long after it.
-use crate::combat::PlayerId;
-use crate::config::AntiKillAbuse;
+use crate::combatlog_core::combat::PlayerId;
+use crate::combatlog_core::config::AntiKillAbuse;
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug, Default)]

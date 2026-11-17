@@ -6,6 +6,8 @@ publish = false
 license = "GPL-3.0-only"
 
 [dependencies]
-# The launcher (or stage.py) points this at the Horizon source the game is built from.
-horizon-mod-api = { git = "https://github.com/arismoko/horizon" }
-combatlog-core = { path = "core" }
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+

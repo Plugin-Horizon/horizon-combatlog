@@ -5,19 +5,22 @@
 //! Hitting a player tags both sides for a while; a tagged player's logout kills them, their
 //! Mending repairs nothing and the commands on the list are refused with a damage penalty.
 //! Config: `config/combatlog-common.toml`, re-read when it changes. `/combatlog reload|status|untag`.
-use combatlog_core::abuse::KillLog;
-use combatlog_core::admin::{self, Admin};
-use combatlog_core::cmds;
-use combatlog_core::combat::{PlayerId, Tagger, effective_mode};
-use combatlog_core::config::{Config, DEFAULT_TOML, Display, LogoutMode};
-use combatlog_core::restrict::{self, Action, Guard};
-use combatlog_core::text;
+
+pub mod combatlog_core;
+use crate::combatlog_core::abuse::KillLog;
+use crate::combatlog_core::admin::{self, Admin};
+use crate::combatlog_core::cmds;
+use crate::combatlog_core::combat::{PlayerId, Tagger, effective_mode};
+use crate::combatlog_core::config::{Config, DEFAULT_TOML, Display, LogoutMode};
+use crate::combatlog_core::restrict::{self, Action, Guard};
+use crate::combatlog_core::text;
 use mod_api::{
     Command, CommandArgumentValue, Config as NativeConfig, ConfigKind, ConfigLoadingEvent,
     ConfigReloadingEvent, EnderPearlTeleportEvent, EntityToggleGlideEvent, Flow, GameMode,
     HostSide, Hooks, ItemConsumptionTeleportEvent, LevelRandomHost, LivingDamagePostEvent,
-    PlayerCommandEvent, PlayerCommandsSentEvent, PlayerDiedEvent, PlayerDisconnectedEvent,
-    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRiptideEvent, QuitReason,
+    NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
+    PlayerCommandEvent, PlayerCommandsSentEvent, PlayerDiedEvent, PlayerKickedEvent,
+    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRiptideEvent,
     PlayerTeleportEndGatewayEvent, PlayerTeleportedEvent, RegisterCommandsEvent,
     RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent,
     ServerTickPhase, Text,
@@ -277,12 +280,15 @@ fn is_admin_command(line: &str) -> bool {
     root == admin::LABEL || root == format!("{0}:{0}", admin::LABEL)
 }
 
-/// The provider's answer for `combatlog.admin`, else the configured operator level (the engine's own check).
-fn may_admin(host: &dyn ServerHost, uuid: u128, level: u8) -> bool {
-    host.player(uuid).is_some_and(|p| {
-        let now = p.permission_level(host).unwrap_or(0);
-        p.permission_value(host, ADMIN_NODE).unwrap_or(now >= level)
-    })
+/// The typed node `combatlog.admin`, declared with the configured operator level as its default.
+fn admin_node() -> PermissionNode {
+    PermissionNode::new(ADMIN_NODE, PermissionValueType::Boolean)
+}
+
+/// The permission handler's answer for `combatlog.admin` (its default is the configured operator level).
+// The node's default level is gathered once at startup; a reloaded `min_permission` does not change it.
+fn may_admin(host: &mut dyn ServerHost, uuid: u128, _level: u8) -> bool {
+    host.player(uuid).is_some_and(|p| p.permission_bool(&mut *host, &admin_node()).unwrap_or(false))
 }
 
 /// The `/combatlog` usages as arismoko's command syntax: the player argument is a plain word
@@ -490,7 +496,7 @@ impl Hooks for CombatLog {
         // `/combatlog` is for `combatlog.admin` (the tree leaves it out for others; this answers the typed line).
         if is_admin_command(event.command) {
             let level = u8::try_from(st.cfg.admin.min_permission).unwrap_or(4);
-            if !may_admin(&*host, event.player, level) {
+            if !may_admin(&mut *host, event.player, level) {
                 let mut style = TextStyle::default();
                 style.color = Some("#FF5555".to_string());
                 event.replies.push(Text::literal(NO_PERMISSION).with_style(style));
@@ -673,19 +679,10 @@ impl Hooks for CombatLog {
         }
     }
 
-    /// The quit reason, heard right after `player_logged_out` for the same player (so it cannot
-    /// change that hook's punishment). A kick is kept in `kicked`, as the kick hook kept it; the set
-    /// is still never read, as before.
-    fn player_disconnected(
-        &self,
-        _host: &mut dyn ServerHost,
-        event: &mut PlayerDisconnectedEvent<'_>,
-    ) {
-        let mut st = lock(&self.state);
-        st.kicked.remove(&event.player);
-        if event.reason == QuitReason::Kicked {
-            st.kicked.insert(event.player);
-        }
+    /// A kick is kept in `kicked`. Horizon main has no separate quit-reason hook: this is `player_kicked`,
+    /// which fires before `player_logged_out` clears the entry again. The set is still never read, as before.
+    fn player_kicked(&self, _host: &mut dyn ServerHost, event: &mut PlayerKickedEvent<'_>) {
+        lock(&self.state).kicked.insert(event.player);
     }
 
     /// TODO(arismoko-api: player_logging_out): arismoko has no hook before the player leaves, so a
@@ -745,7 +742,7 @@ impl Hooks for CombatLog {
     /// Tab list: `/combatlog` (and its sub-command names) leaves the tree of a player without `combatlog.admin`.
     fn player_commands_sent(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandsSentEvent<'_>) {
         let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
-        if !may_admin(&*host, event.player, level) {
+        if !may_admin(&mut *host, event.player, level) {
             event.names.retain(|n| {
                 let n = n.to_ascii_lowercase();
                 n != admin::LABEL && n != format!("{0}:{0}", admin::LABEL)
@@ -753,10 +750,15 @@ impl Hooks for CombatLog {
         }
     }
 
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
+        let _ = event.nodes.add(admin_node(), NodeDefault::Level(PermissionLevel::from_level(i32::from(level))));
+    }
+
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
         for line in admin::USAGES {
-            event.commands.push(Command::op(&usage(line), level).with_node(ADMIN_NODE));
+            event.commands.push(Command::op(&usage(line), level).with_node(&admin_node()));
         }
     }
 

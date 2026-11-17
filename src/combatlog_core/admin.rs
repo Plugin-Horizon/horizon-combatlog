@@ -1,6 +1,6 @@
 //! `/combatlog reload | status <player> | untag <player>`: parsing and the answers.
-use crate::config::Config;
-use crate::text::fill;
+use crate::combatlog_core::config::Config;
+use crate::combatlog_core::text::fill;
 
 pub const LABEL: &str = "combatlog";
 

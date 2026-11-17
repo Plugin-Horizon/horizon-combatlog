@@ -1,7 +1,7 @@
 //! What a tagged player may not do: glide, teleport, riptide. The game glue asks before (or,
 //! where the engine only tells afterwards, right after) the action and carries out the answer.
-use crate::combat::PlayerId;
-use crate::config::Config;
+use crate::combatlog_core::combat::PlayerId;
+use crate::combatlog_core::config::Config;
 use std::collections::BTreeMap;
 
 /// An action the restrictions look at.

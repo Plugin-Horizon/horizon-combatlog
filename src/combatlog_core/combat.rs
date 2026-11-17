@@ -1,5 +1,5 @@
 //! Who is in combat and for how long. No game types: ticks in, answers out.
-use crate::config::TagMode;
+use crate::combatlog_core::config::TagMode;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type PlayerId = u128;

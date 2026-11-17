@@ -1,8 +1,8 @@
 //! The console commands the mod runs for what the engine has no helper for: the boss bar timer,
 //! effects on tag, damage penalties and moving a player back.
-use crate::combat::PlayerId;
-use crate::config::{Config, TagEffect};
-use crate::text;
+use crate::combatlog_core::combat::PlayerId;
+use crate::combatlog_core::config::{Config, TagEffect};
+use crate::combatlog_core::text;
 
 /// The boss bar of one player's timer.
 pub fn bar_id(id: PlayerId) -> String {
