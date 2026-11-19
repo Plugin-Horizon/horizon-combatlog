@@ -17,6 +17,28 @@ pub fn effective_mode(mode: TagMode, attacker_ok: bool, victim_ok: bool) -> Opti
     }
 }
 
+/// Whether damage of this type, with a player as its cause, starts a fight. As the original's
+/// `resolveAttacker`: a player's own hit (melee, thorns) or a player's arrow, trident or wither
+/// skull; thrown snowballs, eggs, wind charges, fireballs, potions, rods and explosions do not.
+pub fn tags_by_damage_type(damage_type: &str) -> bool {
+    let id = damage_type.strip_prefix("minecraft:").unwrap_or(damage_type);
+    matches!(
+        id,
+        "player_attack" | "thorns" | "mace_smash" | "spear" | "arrow" | "trident" | "wither_skull"
+    )
+}
+
+/// Whether this damage is a block explosion (no entity behind it) or a respawn anchor's: the
+/// original's `explosions.set-combat-on-explosion` trigger for `EntityDamageByBlockEvent`.
+pub fn is_block_blast(damage_type: &str, causing: i32, direct: i32) -> bool {
+    let id = damage_type.strip_prefix("minecraft:").unwrap_or(damage_type);
+    match id {
+        "bad_respawn_point" => true,
+        "explosion" => causing <= 0 && direct <= 0,
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 struct Tag {
     until: u64,
@@ -291,6 +313,25 @@ mod tests {
         assert!(!t.tag_alone(A, 100, true));
         assert_eq!(t.seconds_left(A), 5);
         assert_eq!(ticks(&mut t, 100), vec![A]);
+    }
+
+    #[test]
+    fn only_melee_and_the_three_projectiles_start_a_fight() {
+        for t in ["minecraft:player_attack", "thorns", "minecraft:arrow", "minecraft:trident", "minecraft:wither_skull"] {
+            assert!(tags_by_damage_type(t), "{t}");
+        }
+        for t in ["minecraft:thrown", "minecraft:wind_charge", "minecraft:fireball", "minecraft:indirect_magic", "minecraft:explosion", "minecraft:mob_attack"] {
+            assert!(!tags_by_damage_type(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn block_blasts_have_no_entity_behind_them() {
+        assert!(is_block_blast("minecraft:explosion", 0, 0));
+        assert!(!is_block_blast("minecraft:explosion", 5, 0));
+        assert!(!is_block_blast("minecraft:explosion", 0, 7));
+        assert!(is_block_blast("minecraft:bad_respawn_point", 0, 0));
+        assert!(!is_block_blast("minecraft:player_attack", 0, 0));
     }
 
     #[test]

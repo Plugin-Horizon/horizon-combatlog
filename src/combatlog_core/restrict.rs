@@ -46,24 +46,23 @@ pub struct Guard {
 }
 
 impl Guard {
-    /// A player launched with riptide at tick `now`. Whether to stop it: in combat with
-    /// `riptide-stop`, or while an earlier stop's `riptide-cooldown-ms` lock still runs. A
-    /// stop (re)starts the lock.
+    /// A player launched with riptide at tick `now`. As the original: in combat with
+    /// `riptide-stop`, the first launch is allowed and starts a `riptide-cooldown-ms` window; a
+    /// launch inside that window is stopped (the window is not renewed by the stop).
     pub fn riptide(&mut self, cfg: &Config, id: PlayerId, tagged: bool, now: u64) -> bool {
-        if !cfg.combat_log.restrictions.riptide.stop {
+        if !cfg.combat_log.restrictions.riptide.stop || !tagged {
             return false;
         }
-        let locked = self
+        let window_open = self
             .riptide_until
             .get(&id)
             .is_some_and(|until| *until > now);
-        if !tagged && !locked {
-            self.riptide_until.remove(&id);
-            return false;
+        if window_open {
+            return true;
         }
         self.riptide_until
             .insert(id, now + cfg.riptide_cooldown_ticks());
-        true
+        false
     }
 
     /// `/tp` moved a player to `to`. Whether to move them back: not when this is the move back
@@ -149,16 +148,15 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_riptide_locks_the_trident_past_the_tag() {
+    fn the_first_riptide_in_combat_is_allowed_and_a_second_within_the_cooldown_is_stopped() {
         let c = cfg("[combat-log.restrictions.riptide]\nstop = true\ncooldown = 1000\n");
         let mut g = Guard::default();
+        // Not in combat: nothing happens and nothing starts.
         assert!(!g.riptide(&c, 1, false, 0));
-        assert!(g.riptide(&c, 1, true, 10));
-        // The tag ran out, the 20-tick lock did not.
-        assert!(g.riptide(&c, 1, false, 25));
-        // That stop renewed the lock to tick 45.
-        assert!(g.riptide(&c, 1, false, 44));
-        assert!(!g.riptide(&c, 1, false, 64));
+        assert!(!g.riptide(&c, 1, true, 10));
+        // Inside the 20-tick window: stopped, and the stop does not renew the window.
+        assert!(g.riptide(&c, 1, true, 29));
+        assert!(!g.riptide(&c, 1, true, 30));
     }
 
     #[test]

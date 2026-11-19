@@ -67,6 +67,31 @@ pub fn usage(cfg: &Config) -> Vec<String> {
     ]
 }
 
+/// The online names to offer for the typed `line` (`combatlog status|untag <partial>`), as the
+/// original's tab completion; empty anywhere else. Names are matched by prefix, in any case.
+pub fn completions(line: &str, online: &[String]) -> Vec<String> {
+    let line = line.trim_start_matches('/');
+    let mut words: Vec<&str> = line.split_whitespace().collect();
+    let typing_new = line.ends_with(char::is_whitespace);
+    let label = words.first().map(|w| w.to_ascii_lowercase());
+    if label.as_deref() != Some(LABEL) && label != Some(format!("{LABEL}:{LABEL}")) {
+        return Vec::new();
+    }
+    let partial = if typing_new { "" } else { words.pop().unwrap_or("") };
+    let sub = words.get(1).map(|w| w.to_ascii_lowercase());
+    if words.len() != 2 || !matches!(sub.as_deref(), Some("status" | "untag")) {
+        return Vec::new();
+    }
+    let partial = partial.to_ascii_lowercase();
+    let mut names: Vec<String> = online
+        .iter()
+        .filter(|n| n.to_ascii_lowercase().starts_with(&partial))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
 /// What `/combatlog status` shows about a player.
 pub struct Status<'a> {
     pub player: &'a str,
@@ -160,6 +185,17 @@ mod tests {
         assert_eq!(parse("combatlog fly"), Some(Admin::Usage));
         assert_eq!(parse("tpa Steve"), None);
         assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn completes_online_names_after_status_and_untag_only() {
+        let online = vec!["Steve".to_string(), "alex".to_string(), "Stan".to_string()];
+        assert_eq!(completions("/combatlog status ", &online), vec!["Stan", "Steve", "alex"]);
+        assert_eq!(completions("combatlog untag st", &online), vec!["Stan", "Steve"]);
+        assert_eq!(completions("combatlog status Steve ", &online), Vec::<String>::new());
+        assert_eq!(completions("combatlog reload ", &online), Vec::<String>::new());
+        assert_eq!(completions("combatlog sta", &online), Vec::<String>::new());
+        assert_eq!(completions("tpa ", &online), Vec::<String>::new());
     }
 
     #[test]

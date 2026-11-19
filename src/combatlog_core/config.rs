@@ -7,6 +7,7 @@ pub const DEFAULT_TOML: &str = r##"# CombatLog for Horizon. Saved changes are pi
 # Key paths follow the original plugin's config.yml and messages.yml (see the README).
 config-version = 4
 
+[combat-log]
 # Dimensions (or their part after the colon) where nothing is tagged.
 ignored-worlds = ["ffa"]
 
@@ -55,7 +56,10 @@ tag-mode = "both"
 start-below-health = 0.0
 # Killing a player ends the combat of those who were fighting them.
 untag-on-kill = true
-# Explosions (end crystals, block explosions) set combat in the original; not ported yet (GAPS in the README).
+
+[combat-log.triggers.explosions]
+# A block explosion or a respawn anchor hurting a player tags them (end crystals are not heard, see the README).
+set-combat-on-explosion = true
 
 [combat-log.triggers.enderpearl]
 # A landing ender pearl tags its thrower.
@@ -83,7 +87,7 @@ riptide-denied = "&cYou can't use riptide in combat"
 actionbar = "&c{timeLeft}/{maxTime}"
 bossbar-title = "&cIn Combat: {timeLeft}s"
 
-[command-restrictions]
+[combat-log.command-restrictions]
 # "blacklist" blocks the listed commands, "whitelist" blocks all but the listed ones.
 mode = "blacklist"
 commands = ["tpa"]
@@ -99,8 +103,8 @@ max-kills = 5
 remove-kill-after-seconds = 60
 
 [exemptions]
-# Port-only: stands in for the permission combatlog.bypass (default: operators). Players with an
-# operator level of at least this are never tagged (0 = nobody is exempt).
+# The default of the permission combatlog.bypass: operators with a level of at least this have it
+# (0 = only owners). Players with the permission are never tagged.
 bypass-min-permission = 1
 
 [admin]
@@ -176,6 +180,9 @@ pub struct CombatLog {
     pub triggers: Triggers,
     pub tag_effects: Vec<TagEffect>,
     pub messages: Messages,
+    /// The original's key path; the root-level keys of older files still work.
+    pub ignored_worlds: Option<Vec<String>>,
+    pub command_restrictions: Option<CommandRestrictions>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -242,6 +249,21 @@ pub struct Triggers {
     pub start_below_health: f32,
     pub untag_on_kill: bool,
     pub enderpearl: Enderpearl,
+    pub explosions: Explosions,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Explosions {
+    pub set_combat_on_explosion: bool,
+}
+
+impl Default for Explosions {
+    fn default() -> Self {
+        Self {
+            set_combat_on_explosion: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -397,6 +419,7 @@ impl Default for Triggers {
             start_below_health: 0.0,
             untag_on_kill: true,
             enderpearl: Enderpearl::default(),
+            explosions: Explosions::default(),
         }
     }
 }
@@ -516,7 +539,22 @@ impl Default for CommandMessages {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
-        toml::from_str(text).map_err(|e| e.to_string())
+        let mut cfg: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        if let Some(worlds) = cfg.combat_log.ignored_worlds.take() {
+            cfg.ignored_worlds = worlds;
+        }
+        if let Some(restrictions) = cfg.combat_log.command_restrictions.take() {
+            cfg.command_restrictions = restrictions;
+        }
+        Ok(cfg)
+    }
+
+    /// The operator level that has `combatlog.bypass` by default: the configured one, owners when 0.
+    pub fn bypass_default_level(&self) -> u8 {
+        match self.exemptions.bypass_min_permission {
+            0 => 4,
+            n => n,
+        }
     }
 
     /// Ticks a tag lasts (20 a second).
@@ -582,6 +620,7 @@ mod tests {
         assert_eq!(p.triggers.tag_mode, TagMode::Both);
         assert!(p.restrictions.mending.disabled_in_combat);
         assert_eq!(parsed.command_restrictions.commands, vec!["tpa".to_string()]);
+        assert!(parsed.combat_log.triggers.explosions.set_combat_on_explosion);
         assert_eq!(p.messages.combat_log, d.messages.combat_log);
         assert_eq!(p.messages.timer.bossbar_title, d.messages.timer.bossbar_title);
         assert_eq!(parsed.ignored_worlds, vec!["ffa".to_string()]);
@@ -649,6 +688,29 @@ mod tests {
         let cfg = Config::parse("[command-restrictions]\nmode = \"whitelist\"\ncommands = [\"msg\"]\n").unwrap();
         assert!(!cfg.command_blocked("msg Steve hi"));
         assert!(cfg.command_blocked("home"));
+    }
+
+    #[test]
+    fn the_original_key_paths_work_and_beat_the_old_root_keys() {
+        let cfg = Config::parse(
+            "ignored-worlds = [\"old\"]\n[combat-log]\nignored-worlds = [\"arena\"]\n[combat-log.command-restrictions]\nmode = \"whitelist\"\ncommands = [\"msg\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.ignored_worlds, vec!["arena".to_string()]);
+        assert!(cfg.command_blocked("home"));
+        assert!(!cfg.command_blocked("msg x"));
+        let old = Config::parse("ignored-worlds = [\"old\"]\n").unwrap();
+        assert_eq!(old.ignored_worlds, vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn explosions_trigger_is_on_by_default_and_the_bypass_level_follows_the_config() {
+        assert!(Config::default().combat_log.triggers.explosions.set_combat_on_explosion);
+        let off = Config::parse("[combat-log.triggers.explosions]\nset-combat-on-explosion = false\n").unwrap();
+        assert!(!off.combat_log.triggers.explosions.set_combat_on_explosion);
+        assert_eq!(Config::default().bypass_default_level(), 1);
+        let zero = Config::parse("[exemptions]\nbypass-min-permission = 0\n").unwrap();
+        assert_eq!(zero.bypass_default_level(), 4);
     }
 
     #[test]

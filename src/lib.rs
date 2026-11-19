@@ -10,7 +10,7 @@ pub mod combatlog_core;
 use crate::combatlog_core::abuse::KillLog;
 use crate::combatlog_core::admin::{self, Admin};
 use crate::combatlog_core::cmds;
-use crate::combatlog_core::combat::{PlayerId, Tagger, effective_mode};
+use crate::combatlog_core::combat::{self, PlayerId, Tagger, effective_mode};
 use crate::combatlog_core::config::{Config, DEFAULT_TOML, Display, LogoutMode};
 use crate::combatlog_core::restrict::{self, Action, Guard};
 use crate::combatlog_core::text;
@@ -19,11 +19,11 @@ use mod_api::{
     ConfigReloadingEvent, EnderPearlTeleportEvent, EntityToggleGlideEvent, Flow, GameMode,
     HostSide, Hooks, ItemConsumptionTeleportEvent, LevelRandomHost, LivingDamagePostEvent,
     NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
-    PlayerCommandEvent, PlayerCommandsSentEvent, PlayerDiedEvent, PlayerKickedEvent,
+    PlayerCommandEvent, PlayerCommandsSentEvent, PlayerDiedEvent, PlayerElytraBoostEvent, PlayerKickedEvent,
     PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRiptideEvent,
     PlayerTeleportEndGatewayEvent, PlayerTeleportedEvent, RegisterCommandsEvent,
     RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent,
-    ServerTickPhase, Text,
+    ServerTickPhase, Suggestion, TabCompleteEvent, Text,
 };
 use mod_api::text::TextStyle;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,10 +47,13 @@ struct Seen {
     entity: u32,
     name: String,
     permission: u8,
+    /// Holds `combatlog.bypass`.
+    bypass: bool,
     dimension: String,
     position: [f64; 3],
     game_mode: i32,
-    health: f32,
+    /// None when the read failed.
+    health: Option<f32>,
 }
 
 #[derive(Default)]
@@ -63,6 +66,8 @@ struct State {
     /// (`living_damage_post`), resolved at the next tick against the player list: a fight
     /// counts only between two players, teams and invulnerability as the original.
     hits: Vec<(u32, u32)>,
+    /// Entity ids of players a block explosion or respawn anchor hurt (resolved at the next tick).
+    blasts: Vec<u32>,
     /// Players whose logout was already handled by a logging-out hook (still in their level).
     /// Empty on arismoko: there is no such hook yet, see `player_logged_out`.
     left: BTreeSet<PlayerId>,
@@ -87,7 +92,6 @@ struct State {
     owed_file: Option<PathBuf>,
     owed_loaded: bool,
     kicked: BTreeSet<PlayerId>,
-    stopping: bool,
     ticks: u64,
 }
 
@@ -133,7 +137,7 @@ impl State {
     }
 
     fn exempt(&self, player: &Seen) -> bool {
-        self.cfg.bypasses(player.permission) || self.cfg.dimension_ignored(&player.dimension)
+        player.bypass || self.cfg.dimension_ignored(&player.dimension)
     }
 
     fn player(&self, id: PlayerId) -> Option<&Seen> {
@@ -228,21 +232,22 @@ fn game_mode_id(mode: GameMode) -> i32 {
 }
 
 /// What the player list says about `player` now; None when a read fails (the player is gone).
-fn seen(host: &dyn ServerHost, player: PlayerRef) -> Option<Seen> {
+fn seen(host: &mut dyn ServerHost, player: PlayerRef) -> Option<Seen> {
+    let bypass = player.permission_bool(&mut *host, &bypass_node()).unwrap_or(false);
+    let host: &dyn ServerHost = host;
     let entity = player.entity();
     Some(Seen {
         uuid: player.uuid(),
         entity: entity.id(),
         name: player.name(host)?,
         permission: player.permission_level(host)?,
+        bypass,
         dimension: player.dimension(host)?.to_string(),
         position: entity.position(host)?,
         game_mode: game_mode_id(player.game_mode(host)?),
-        // NOTE: a failed health read counts as 0, so a start threshold would tag such a player.
         health: host
             .living(entity)
-            .and_then(|living| living.health(host))
-            .unwrap_or(0.0),
+            .and_then(|living| living.health(host)),
     })
 }
 
@@ -283,6 +288,11 @@ fn is_admin_command(line: &str) -> bool {
 /// The typed node `combatlog.admin`, declared with the configured operator level as its default.
 fn admin_node() -> PermissionNode {
     PermissionNode::new(ADMIN_NODE, PermissionValueType::Boolean)
+}
+
+/// plugin.yml: `combatlog.bypass`, default op. Exempts a player from tagging and every restriction.
+fn bypass_node() -> PermissionNode {
+    PermissionNode::new("combatlog.bypass", PermissionValueType::Boolean)
 }
 
 /// The permission handler's answer for `combatlog.admin` (its default is the configured operator level).
@@ -345,13 +355,11 @@ impl Hooks for CombatLog {
     }
 
     fn server_stopping(&self, host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
-        // Everyone "logs out" when the server stops; that is not combat logging. Boss bars are
-        // saved with the world, so ours go now.
-        let bars: Vec<PlayerId> = {
-            let mut st = lock(&self.state);
-            st.stopping = true;
-            std::mem::take(&mut st.bars).into_iter().collect()
-        };
+        // Boss bars are saved with the world, so ours go now. A tagged player present at the stop is
+        // punished at their logout like any other, as the original (no shutdown exemption).
+        let bars: Vec<PlayerId> = std::mem::take(&mut lock(&self.state).bars)
+            .into_iter()
+            .collect();
         for id in bars {
             host.commands().run_command(&cmds::bar_remove(id));
         }
@@ -368,9 +376,19 @@ impl Hooks for CombatLog {
     ) {
         let attacker = event.source.causing;
         let victim = event.entity;
-        if event.container.health_damage() > 0.0 && attacker > 0 && victim > 0 && attacker != victim
-        {
+        if event.container.health_damage() <= 0.0 || victim <= 0 {
+            return;
+        }
+        // Only melee and a player's arrow, trident or wither skull start a fight; an explosion
+        // without an entity behind it is the original's explosion trigger.
+        if attacker > 0 && attacker != victim && combat::tags_by_damage_type(event.source.damage_type) {
             lock(&self.state).hits.push((attacker as u32, victim as u32));
+        } else if combat::is_block_blast(
+            event.source.damage_type,
+            event.source.causing,
+            event.source.direct,
+        ) {
+            lock(&self.state).blasts.push(victim as u32);
         }
     }
 
@@ -388,13 +406,13 @@ impl Hooks for CombatLog {
             st.ticks += 1;
             let ended = st.tagger.advance();
             let hits = std::mem::take(&mut st.hits);
+            let blasts = std::mem::take(&mut st.blasts);
             let mut fresh: BTreeSet<PlayerId> = std::mem::take(&mut st.fresh);
             let mut started: BTreeSet<PlayerId> = fresh.clone();
-            let players: Vec<Seen> = host
-                .players()
-                .server_players()
+            let listed = host.players().server_players();
+            let players: Vec<Seen> = listed
                 .into_iter()
-                .filter_map(|p| seen(&*host, p))
+                .filter_map(|p| seen(&mut *host, p))
                 .collect();
             let find = |entity: u32| players.iter().find(|p| p.entity == entity);
             let mut fights: Vec<(&Seen, &Seen)> = Vec::new();
@@ -408,7 +426,7 @@ impl Hooks for CombatLog {
                 let below = st.cfg.combat_log.triggers.start_below_health;
                 let in_combat =
                     st.tagger.is_tagged(attacker.uuid) || st.tagger.is_tagged(victim.uuid);
-                if !in_combat && below > 0.0 && victim.health > below {
+                if !in_combat && below > 0.0 && victim.health.is_none_or(|h| h > below) {
                     continue;
                 }
                 let Some(mode) = effective_mode(
@@ -435,6 +453,28 @@ impl Hooks for CombatLog {
                             st.renew.insert(id);
                         }
                     }
+                }
+            }
+            if st.cfg.combat_log.triggers.explosions.set_combat_on_explosion {
+                for entity in blasts {
+                    let Some(victim) = find(entity) else {
+                        continue;
+                    };
+                    let below = st.cfg.combat_log.triggers.start_below_health;
+                    let tagged = st.tagger.is_tagged(victim.uuid);
+                    if st.exempt(victim)
+                        || (!tagged && below > 0.0 && victim.health.is_none_or(|h| h > below))
+                    {
+                        continue;
+                    }
+                    let ticks = st.cfg.duration_ticks();
+                    if st.tagger.tag_alone(victim.uuid, ticks, false) {
+                        eprintln!("[combatlog] {} is in combat", victim.name);
+                        started.insert(victim.uuid);
+                    } else {
+                        st.renew.insert(victim.uuid);
+                    }
+                    fresh.insert(victim.uuid);
                 }
             }
             st.players = players.clone();
@@ -538,7 +578,7 @@ impl Hooks for CombatLog {
             return Flow::Cancel;
         }
         // The pearl trigger: a landing pearl starts (or renews) its thrower's tag.
-        let me = seen(&*host, player);
+        let me = seen(&mut *host, player);
         let mut st = lock(&self.state);
         let t = &st.cfg.combat_log.triggers;
         if !t.enderpearl.set_combat_on_land {
@@ -619,13 +659,24 @@ impl Hooks for CombatLog {
         }
     }
 
+    fn player_elytra_boost(&self, _host: &mut dyn ServerHost, event: &mut PlayerElytraBoostEvent<'_>) {
+        // TODO(arismoko-api: elytra_boost_cancel): the engine only tells; the boost cannot be
+        // refused, so it gets the message and the penalty only.
+        let mut st = lock(&self.state);
+        let tagged = st.tagger.is_tagged(event.player);
+        if let Some(message) = restrict::refused(&st.cfg, Action::Elytra, tagged).map(str::to_owned)
+        {
+            st.refuse(event.player, event.name, message);
+        }
+    }
+
     fn player_riptide(&self, host: &mut dyn ServerHost, event: &mut PlayerRiptideEvent<'_>) {
         // The position the launch started from: the acting player's, as the original read it.
-        let at = host
+        let acting = host
             .players()
             .acting_player()
-            .filter(|p| p.uuid() == event.player)
-            .and_then(|p| seen(&*host, p));
+            .filter(|p| p.uuid() == event.player);
+        let at = acting.and_then(|p| seen(&mut *host, p));
         let mut st = lock(&self.state);
         let tagged = st.tagger.is_tagged(event.player);
         let now = st.ticks;
@@ -659,14 +710,14 @@ impl Hooks for CombatLog {
             if let Some(killer) = killer {
                 let cfg = st.cfg.anti_kill_abuse.clone();
                 let now = st.ticks;
-                let name = st.player(killer).map(|p| p.name.clone());
+                // A killer or victim who is not in the list is "Unknown", as the original's punish.
+                let name = st
+                    .player(killer)
+                    .map_or_else(|| "Unknown".to_owned(), |p| p.name.clone());
                 let victim = st
                     .player(event.player)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
-                if st.kills.record(&cfg, killer, event.player, now)
-                    && let Some(name) = name
-                {
+                    .map_or_else(|| "Unknown".to_owned(), |p| p.name.clone());
+                if st.kills.record(&cfg, killer, event.player, now) {
                     eprintln!("[combatlog] kill abuse by {name}");
                     st.commands.extend(cfg.punish_commands.iter().map(|c| {
                         text::fill(c, &[("killer", &name), ("victim", &victim)])
@@ -700,7 +751,7 @@ impl Hooks for CombatLog {
             let handled = st.left.remove(&event.player);
             let was_tagged = st.tagger.untag(event.player);
             st.effects.remove(&event.player);
-            if handled || st.stopping || !was_tagged {
+            if handled || !was_tagged {
                 return;
             }
             match st.cfg.combat_log.punishment.logout.mode {
@@ -753,6 +804,24 @@ impl Hooks for CombatLog {
     fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
         let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
         let _ = event.nodes.add(admin_node(), NodeDefault::Level(PermissionLevel::from_level(i32::from(level))));
+        let bypass = lock(&self.state).cfg.bypass_default_level();
+        let _ = event.nodes.add(bypass_node(), NodeDefault::Level(PermissionLevel::from_level(i32::from(bypass))));
+    }
+
+    /// Online player names after `/combatlog status|untag`, as the original's tab completion.
+    fn tab_complete(&self, host: &mut dyn ServerHost, event: &mut TabCompleteEvent<'_>) {
+        let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
+        if !is_admin_command(event.command.trim_start_matches('/'))
+            || !may_admin(&mut *host, event.player, level)
+        {
+            return;
+        }
+        let names: Vec<String> = lock(&self.state).players.iter().map(|p| p.name.clone()).collect();
+        for name in admin::completions(event.command, &names) {
+            event
+                .suggestions
+                .push(Suggestion::new((event.range[0], event.range[1]), name));
+        }
     }
 
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
