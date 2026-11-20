@@ -14,6 +14,8 @@ pub enum Action {
     EndGateway,
     /// `/tp` or `/teleport` moved the player (heard after the move).
     CommandTeleport,
+    /// A nether or end portal (Bukkit's `PlayerPortalEvent` is a `PlayerTeleportEvent`).
+    Portal,
 }
 
 /// The message template for a refused `action` of a player who is `tagged`; None when it is
@@ -29,7 +31,7 @@ pub fn refused(cfg: &Config, action: Action, tagged: bool) -> Option<&str> {
             .disabled_in_combat
             .then_some(cfg.combat_log.messages.elytra_use_denied.as_str()),
         Action::EnderPearl if r.teleporting.allow_enderpearl => None,
-        Action::EnderPearl | Action::ChorusFruit | Action::EndGateway | Action::CommandTeleport => {
+        Action::EnderPearl | Action::ChorusFruit | Action::EndGateway | Action::CommandTeleport | Action::Portal => {
             r.teleporting
                 .disabled_in_combat
                 .then_some(cfg.combat_log.messages.teleporting_denied.as_str())
@@ -109,6 +111,7 @@ mod tests {
             Action::ChorusFruit,
             Action::EndGateway,
             Action::CommandTeleport,
+            Action::Portal,
         ] {
             assert_eq!(refused(&c, a, true), None, "{a:?}");
         }
@@ -124,6 +127,8 @@ mod tests {
         );
         assert!(refused(&c, Action::ChorusFruit, true).is_some());
         assert!(refused(&c, Action::EndGateway, true).is_some());
+        assert!(refused(&c, Action::Portal, true).is_some());
+        assert_eq!(refused(&c, Action::Portal, false), None);
         assert_eq!(refused(&c, Action::EnderPearl, false), None);
         assert!(refused(&c, Action::Elytra, true).is_some());
     }

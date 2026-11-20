@@ -585,12 +585,15 @@ impl Config {
         }
     }
 
-    /// Whether nothing is tagged in `dimension` (`minecraft:overworld`).
+    /// Whether nothing is tagged in `dimension` (`minecraft:overworld`). `ignored-worlds` takes
+    /// world names as the original does (`world`, `world_nether`, `world_the_end`), a dimension
+    /// id, or its last part (`ffa`).
     pub fn dimension_ignored(&self, dimension: &str) -> bool {
         let short = dimension.rsplit(':').next().unwrap_or(dimension);
+        let world = world_name(dimension);
         self.ignored_worlds
             .iter()
-            .any(|d| d == dimension || d == short)
+            .any(|d| d == dimension || d == short || *d == world)
     }
 
     /// Ticks a riptide stays locked after it was stopped (20 a second, rounded up).
@@ -602,6 +605,17 @@ impl Config {
     pub fn bypasses(&self, permission: u8) -> bool {
         let at = self.exemptions.bypass_min_permission;
         at > 0 && permission >= at
+    }
+}
+
+/// The world name a Bukkit server shows for a dimension: `world`, `world_nether`, `world_the_end`,
+/// and the last part of any other id (`mymod:moon` is `moon`).
+pub fn world_name(dimension: &str) -> String {
+    match dimension {
+        "minecraft:overworld" => "world".to_owned(),
+        "minecraft:the_nether" => "world_nether".to_owned(),
+        "minecraft:the_end" => "world_the_end".to_owned(),
+        other => other.rsplit(':').next().unwrap_or(other).to_owned(),
     }
 }
 
@@ -722,6 +736,9 @@ mod tests {
         assert!(cfg.dimension_ignored("minecraft:the_end"));
         assert!(cfg.dimension_ignored("custom:ffa"));
         assert!(!cfg.dimension_ignored("minecraft:overworld"));
+        assert_eq!(world_name("minecraft:the_nether"), "world_nether");
+        assert_eq!(world_name("minecraft:the_end"), "world_the_end");
+        assert_eq!(world_name("mymod:moon"), "moon");
         assert!(cfg.bypasses(2));
         assert!(!cfg.bypasses(1));
         let off = Config::parse("[exemptions]\nbypass-min-permission = 0\n").unwrap();

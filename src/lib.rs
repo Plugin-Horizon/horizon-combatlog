@@ -16,7 +16,8 @@ use crate::combatlog_core::restrict::{self, Action, Guard};
 use crate::combatlog_core::text;
 use mod_api::{
     Command, CommandArgumentValue, Config as NativeConfig, ConfigKind, ConfigLoadingEvent,
-    ConfigReloadingEvent, EnderPearlTeleportEvent, EntityToggleGlideEvent, Flow, GameMode,
+    ConfigReloadingEvent, EnderPearlTeleportEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent,
+    EntityToggleGlideEvent, EntityTravelToDimensionEvent, Flow, GameMode,
     HostSide, Hooks, ItemConsumptionTeleportEvent, LevelRandomHost, LivingDamagePostEvent,
     NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
     PlayerCommandEvent, PlayerCommandsSentEvent, PlayerDiedEvent, PlayerElytraBoostEvent, PlayerKickedEvent,
@@ -25,6 +26,8 @@ use mod_api::{
     RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent,
     ServerTickPhase, Suggestion, TabCompleteEvent, Text,
 };
+#[cfg(feature = "horizon_player_leaving")]
+use mod_api::PlayerLeavingEvent;
 use mod_api::text::TextStyle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -93,6 +96,12 @@ struct State {
     owed_loaded: bool,
     kicked: BTreeSet<PlayerId>,
     ticks: u64,
+    /// End crystals by entity id: None while they exist, the tick they may be forgotten after once gone
+    /// (a crystal leaves the level before its blast hurts anyone).
+    crystals: BTreeMap<u32, Option<u64>>,
+    /// Victim -> (the player who hit them last, tick): every player hit, tagged or not, for the kill-abuse
+    /// count (the original counts every kill whose killer is a player).
+    last_hit: BTreeMap<PlayerId, (PlayerId, u64)>,
 }
 
 impl State {
@@ -383,12 +392,18 @@ impl Hooks for CombatLog {
         // without an entity behind it is the original's explosion trigger.
         if attacker > 0 && attacker != victim && combat::tags_by_damage_type(event.source.damage_type) {
             lock(&self.state).hits.push((attacker as u32, victim as u32));
-        } else if combat::is_block_blast(
-            event.source.damage_type,
-            event.source.causing,
-            event.source.direct,
-        ) {
-            lock(&self.state).blasts.push(victim as u32);
+        } else {
+            let mut st = lock(&self.state);
+            // An end crystal's blast (`explosion` with the crystal as the direct entity) tags as a block explosion does.
+            let crystal = event.source.damage_type.strip_prefix("minecraft:").unwrap_or(event.source.damage_type)
+                == "explosion"
+                && event.source.direct > 0
+                && st.crystals.contains_key(&(event.source.direct as u32));
+            if crystal
+                || combat::is_block_blast(event.source.damage_type, event.source.causing, event.source.direct)
+            {
+                st.blasts.push(victim as u32);
+            }
         }
     }
 
@@ -404,6 +419,9 @@ impl Hooks for CombatLog {
             let mut st = lock(&self.state);
             st.load_owed(&*host);
             st.ticks += 1;
+            let now_tick = st.ticks;
+            st.crystals.retain(|_, gone| gone.is_none_or(|t| t > now_tick));
+            st.last_hit.retain(|_, (_, t)| *t + 100 > now_tick);
             let ended = st.tagger.advance();
             let hits = std::mem::take(&mut st.hits);
             let blasts = std::mem::take(&mut st.blasts);
@@ -422,6 +440,8 @@ impl Hooks for CombatLog {
                 }
             }
             for (attacker, victim) in fights {
+                let at = st.ticks;
+                st.last_hit.insert(victim.uuid, (attacker.uuid, at));
                 // The health threshold only starts a tag: a fight already on counts every hit.
                 let below = st.cfg.combat_log.triggers.start_below_health;
                 let in_combat =
@@ -623,6 +643,44 @@ impl Hooks for CombatLog {
         self.teleport_hook(event.player, event.name, Action::EndGateway)
     }
 
+    /// A nether or end portal is a teleport too (Bukkit's `PlayerPortalEvent` extends `PlayerTeleportEvent`).
+    /// The cause names are the engine's; only a cause that says `portal` is refused.
+    fn entity_travel_to_dimension(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut EntityTravelToDimensionEvent<'_>,
+    ) -> Flow {
+        if !event.cause.to_ascii_lowercase().contains("portal") {
+            return Flow::Continue;
+        }
+        let Some(player) = host
+            .players()
+            .server_players()
+            .into_iter()
+            .find(|p| p.entity() == event.entity)
+        else {
+            return Flow::Continue;
+        };
+        let name = player.name(&*host).unwrap_or_default();
+        self.teleport_hook(player.uuid(), &name, Action::Portal)
+    }
+
+    /// End crystals are remembered so a blast whose direct entity was one can be told from other explosions.
+    fn entity_join_level(&self, _host: &mut dyn ServerHost, event: &mut EntityJoinLevelEvent<'_>) -> Flow {
+        if event.kind == "minecraft:end_crystal" {
+            lock(&self.state).crystals.insert(event.entity, None);
+        }
+        Flow::Continue
+    }
+
+    fn entity_leave_level(&self, _host: &mut dyn ServerHost, event: &mut EntityLeaveLevelEvent<'_>) {
+        let mut st = lock(&self.state);
+        let until = st.ticks + 40;
+        if let Some(slot) = st.crystals.get_mut(&event.entity) {
+            *slot = Some(until);
+        }
+    }
+
     fn player_teleported(&self, _host: &mut dyn ServerHost, event: &mut PlayerTeleportedEvent<'_>) {
         // Heard after the move: a refused /tp is undone by moving the player back, into the
         // dimension the last tick saw them in.
@@ -704,10 +762,19 @@ impl Hooks for CombatLog {
             // Read before the death forgets who hit whom.
             let killer = st.tagger.last_attacker(event.player);
             let on_kill = st.cfg.combat_log.triggers.untag_on_kill;
+            // Kill abuse counts every kill by a player, also one whose hits never tagged (an exempt killer).
+            let abuse_killer = killer.or_else(|| {
+                let now = st.ticks;
+                st.last_hit
+                    .get(&event.player)
+                    .filter(|(_, t)| now <= *t + 100)
+                    .map(|(k, _)| *k)
+            });
             for id in st.tagger.died(event.player, killer, on_kill) {
                 st.tag_ended(id, &mut clear);
             }
-            if let Some(killer) = killer {
+            st.last_hit.remove(&event.player);
+            if let Some(killer) = abuse_killer {
                 let cfg = st.cfg.anti_kill_abuse.clone();
                 let now = st.ticks;
                 // A killer or victim who is not in the list is "Unknown", as the original's punish.
@@ -734,6 +801,47 @@ impl Hooks for CombatLog {
     /// which fires before `player_logged_out` clears the entry again. The set is still never read, as before.
     fn player_kicked(&self, _host: &mut dyn ServerHost, event: &mut PlayerKickedEvent<'_>) {
         lock(&self.state).kicked.insert(event.player);
+    }
+
+    /// `player_leaving` (horizon-rust/horizon#18762): the player is still in the world, so the logout kill and the
+    /// announcement happen now, as the original does at `PlayerQuitEvent`; their items drop where they logged out.
+    /// Off by default (cargo feature `horizon_player_leaving`): the SDK this mod is pinned to does not have the hook.
+    #[cfg(feature = "horizon_player_leaving")]
+    fn player_leaving(&self, host: &mut dyn ServerHost, event: &mut PlayerLeavingEvent<'_>) {
+        let (announce, run_now) = {
+            let mut st = lock(&self.state);
+            if !st.tagger.untag(event.player) {
+                return;
+            }
+            st.left.insert(event.player);
+            let mut run_now: Vec<String> = Vec::new();
+            match st.cfg.combat_log.punishment.logout.mode {
+                LogoutMode::None => {}
+                LogoutMode::Kill => run_now.push(format!("kill {}", event.name)),
+                LogoutMode::Commands => {
+                    run_now.extend(
+                        st.cfg
+                            .combat_log
+                            .punishment
+                            .logout
+                            .commands
+                            .iter()
+                            .map(|c| text::fill(c, &[("player", event.name)])),
+                    );
+                }
+            }
+            let announce = legacy(&text::fill(
+                &st.cfg.combat_log.messages.combat_log,
+                &[("player", event.name)],
+            ));
+            (announce, run_now)
+        };
+        for command in run_now {
+            if !host.commands().run_command(&command) {
+                eprintln!("[combatlog] command failed: {command}");
+            }
+        }
+        let _ = host.messages().broadcast(announce);
     }
 
     /// TODO(arismoko-api: player_logging_out): arismoko has no hook before the player leaves, so a

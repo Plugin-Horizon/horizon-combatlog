@@ -108,11 +108,11 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 
 - Mending cannot be refused in combat (`restrictions.mending.disabled_in_combat` is not applied): arismoko moved Mending to an item part a trait mod cannot veto.
 - A refused elytra glide cannot be stopped; the player only gets the message and the penalty.
-- There is no hook before a player leaves, so a tagged logout is punished after they left: the kill waits for their next join, the commands and the announcement run at once.
+- There is no hook before a player leaves in the pinned SDK, so a tagged logout is punished after they left: the kill waits for their next join, the commands and the announcement run at once. With the cargo feature `horizon_player_leaving` (needs the `player_leaving` hook, horizon-rust/horizon#18762) the kill, the commands and the announcement happen at the quit.
 - Hits that the health check or invulnerability left at zero are not heard.
 - A firework boost while elytra is disabled gets the message and the penalty, but cannot be refused.
-- Anti-kill-abuse counts only kills by a player whose hit was recorded (the death hook names no killer).
-- Teleports through portals are not refused (no cancelable hook).
+- Anti-kill-abuse counts a kill when a hit of the killer on the victim was heard in the last 5 seconds (the death hook names no killer).
+- Portals are refused as teleports when the engine's cause for the travel says `portal` (unverified); written blind. End crystal blasts tag like block explosions (also written blind).
 
 ## Licence and origin
 

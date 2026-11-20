@@ -125,7 +125,7 @@ pub fn status(cfg: &Config, s: &Status<'_>) -> Vec<String> {
         .map_or(m.value_not_applicable.clone(), |n| format!("{n}s"));
     vec![
         fill(&m.status_title, &[("player", s.player)]),
-        fill(&m.status_world, &[("world", s.dimension)]),
+        fill(&m.status_world, &[("world", &super::config::world_name(s.dimension))]),
         fill(
             &m.status_gamemode,
             &[("gamemode", game_mode_name(s.game_mode))],
@@ -219,6 +219,7 @@ mod tests {
             },
         );
         assert_eq!(tagged[0], "<gold>Combat status for <white>Steve");
+        assert!(tagged[1].ends_with("world"), "{}", tagged[1]);
         assert_eq!(tagged[2], "<gray>Gamemode: <white>SURVIVAL");
         assert_eq!(tagged[3], "<gray>In combat: <white>yes");
         assert_eq!(tagged[4], "<gray>Time left: <white>9s");
