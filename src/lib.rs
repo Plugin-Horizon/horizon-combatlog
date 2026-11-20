@@ -22,7 +22,7 @@ use mod_api::{
     NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
     PlayerCommandEvent, PlayerCommandsSentEvent, PlayerDiedEvent, PlayerElytraBoostEvent, PlayerKickedEvent,
     PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRiptideEvent,
-    PlayerTeleportEndGatewayEvent, PlayerTeleportedEvent, RegisterCommandsEvent,
+    PlayerTeleportEndGatewayEvent, PlayerTeleportedEvent, RegisterNodeCommandsEvent,
     RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent,
     ServerTickPhase, Suggestion, TabCompleteEvent, Text,
 };
@@ -932,7 +932,7 @@ impl Hooks for CombatLog {
         }
     }
 
-    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+    fn register_node_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
         let level = u8::try_from(lock(&self.state).cfg.admin.min_permission).unwrap_or(4);
         for line in admin::USAGES {
             event.commands.push(Command::op(&usage(line), level).with_node(&admin_node()));
