@@ -1,7 +1,7 @@
 //! What a tagged player may not do: glide, teleport, riptide. The game glue asks before (or,
 //! where the engine only tells afterwards, right after) the action and carries out the answer.
-use crate::combat::PlayerId;
-use crate::config::Config;
+use crate::combatlog_core::combat::PlayerId;
+use crate::combatlog_core::config::Config;
 use std::collections::BTreeMap;
 
 /// An action the restrictions look at.
@@ -14,6 +14,8 @@ pub enum Action {
     EndGateway,
     /// `/tp` or `/teleport` moved the player (heard after the move).
     CommandTeleport,
+    /// A nether or end portal (Bukkit's `PlayerPortalEvent` is a `PlayerTeleportEvent`).
+    Portal,
 }
 
 /// The message template for a refused `action` of a player who is `tagged`; None when it is
@@ -29,7 +31,7 @@ pub fn refused(cfg: &Config, action: Action, tagged: bool) -> Option<&str> {
             .disabled_in_combat
             .then_some(cfg.combat_log.messages.elytra_use_denied.as_str()),
         Action::EnderPearl if r.teleporting.allow_enderpearl => None,
-        Action::EnderPearl | Action::ChorusFruit | Action::EndGateway | Action::CommandTeleport => {
+        Action::EnderPearl | Action::ChorusFruit | Action::EndGateway | Action::CommandTeleport | Action::Portal => {
             r.teleporting
                 .disabled_in_combat
                 .then_some(cfg.combat_log.messages.teleporting_denied.as_str())
@@ -46,24 +48,23 @@ pub struct Guard {
 }
 
 impl Guard {
-    /// A player launched with riptide at tick `now`. Whether to stop it: in combat with
-    /// `riptide-stop`, or while an earlier stop's `riptide-cooldown-ms` lock still runs. A
-    /// stop (re)starts the lock.
+    /// A player launched with riptide at tick `now`. As the original: in combat with
+    /// `riptide-stop`, the first launch is allowed and starts a `riptide-cooldown-ms` window; a
+    /// launch inside that window is stopped (the window is not renewed by the stop).
     pub fn riptide(&mut self, cfg: &Config, id: PlayerId, tagged: bool, now: u64) -> bool {
-        if !cfg.combat_log.restrictions.riptide.stop {
+        if !cfg.combat_log.restrictions.riptide.stop || !tagged {
             return false;
         }
-        let locked = self
+        let window_open = self
             .riptide_until
             .get(&id)
             .is_some_and(|until| *until > now);
-        if !tagged && !locked {
-            self.riptide_until.remove(&id);
-            return false;
+        if window_open {
+            return true;
         }
         self.riptide_until
             .insert(id, now + cfg.riptide_cooldown_ticks());
-        true
+        false
     }
 
     /// `/tp` moved a player to `to`. Whether to move them back: not when this is the move back
@@ -110,6 +111,7 @@ mod tests {
             Action::ChorusFruit,
             Action::EndGateway,
             Action::CommandTeleport,
+            Action::Portal,
         ] {
             assert_eq!(refused(&c, a, true), None, "{a:?}");
         }
@@ -125,6 +127,8 @@ mod tests {
         );
         assert!(refused(&c, Action::ChorusFruit, true).is_some());
         assert!(refused(&c, Action::EndGateway, true).is_some());
+        assert!(refused(&c, Action::Portal, true).is_some());
+        assert_eq!(refused(&c, Action::Portal, false), None);
         assert_eq!(refused(&c, Action::EnderPearl, false), None);
         assert!(refused(&c, Action::Elytra, true).is_some());
     }
@@ -149,16 +153,15 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_riptide_locks_the_trident_past_the_tag() {
+    fn the_first_riptide_in_combat_is_allowed_and_a_second_within_the_cooldown_is_stopped() {
         let c = cfg("[combat-log.restrictions.riptide]\nstop = true\ncooldown = 1000\n");
         let mut g = Guard::default();
+        // Not in combat: nothing happens and nothing starts.
         assert!(!g.riptide(&c, 1, false, 0));
-        assert!(g.riptide(&c, 1, true, 10));
-        // The tag ran out, the 20-tick lock did not.
-        assert!(g.riptide(&c, 1, false, 25));
-        // That stop renewed the lock to tick 45.
-        assert!(g.riptide(&c, 1, false, 44));
-        assert!(!g.riptide(&c, 1, false, 64));
+        assert!(!g.riptide(&c, 1, true, 10));
+        // Inside the 20-tick window: stopped, and the stop does not renew the window.
+        assert!(g.riptide(&c, 1, true, 29));
+        assert!(!g.riptide(&c, 1, true, 30));
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # horizon-combatlog
 
+## Port status
+
+Compared with CombatLog 1.20 (18c0fd1) (estimate): **83 %** of the original's commands, permissions, config keys, messages and features work today; **88 %** once our open Horizon PRs are merged; the engine and SDK figures are not estimated. Estimated count: ~104/~125 items. Status: not yet compiled after the 2026-11-20 round.
+
 > **Unofficial Rust port of CombatLog for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the CombatLog authors.**
 
 Combat tagging for [Horizon](https://github.com/arismoko/horizon) servers, as a native trait mod
@@ -28,8 +32,9 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   as in the original (no damage). A command is matched by its name or without its namespace (`essentials:tpa` is `tpa`).
 - **Killing ends combat**: when a player dies, their own tag ends. Their killer's tag ends too, unless the killer still
   fights someone else (`untag-on-kill`). A death without a player killer leaves the other fighters tagged.
-- Operators (permission level 1 and up) are never tagged; dimensions can be excluded. A server shutdown is not combat
-  logging.
+- Players with `combatlog.bypass` (operators by default) are never tagged; dimensions can be excluded. Only melee and a
+  player's arrow, trident or wither skull start a fight (other projectiles do not). A block explosion or a respawn anchor
+  tags the hurt player (`triggers.explosions.set-combat-on-explosion`).
 
 Added in 0.2.0, **written blind (not built, not run on a server yet)**; all off by default, as on the server the
 original was configured for:
@@ -40,8 +45,8 @@ original was configured for:
   plugin's teleport listener does not see portal travel either).
 - **Elytra restriction** (`elytra-disabled`): starting a glide in combat is answered with the message and the damage
   penalty. The engine cannot stop the glide yet (see below), so the player keeps gliding.
-- **Riptide** (`riptide-stop`, `riptide-cooldown-ms`): a riptide launch in combat is ended by putting the player back
-  where it started, and the trident stays locked for the cooldown, also after the tag ran out.
+- **Riptide** (`riptide-stop`, `riptide-cooldown-ms`): as the original, the first riptide in combat is allowed and starts
+  the cooldown; a second one inside it is ended by putting the player back where it started.
 - A refused elytra start, teleport or riptide takes the damage penalty (`punishment.damage`); a blocked command does not.
 - **Boss bar timer** (`timer.display = "bossbar"`): a red bar per tagged player counting down, through the vanilla
   `/bossbar` command; removed when the tag ends, the player leaves or the server stops.
@@ -58,8 +63,9 @@ original was configured for:
 
 `config/combatlog-common.toml`, written with defaults when missing and reloaded within a second of saving. The key paths are those of the original's `config.yml` and `messages.yml`, written as TOML tables: `combat-log.timer.duration-seconds`
 is `[combat-log.timer]` with `duration-seconds`. The defaults are the original's shipped defaults (the jar's `config.yml`).
-Port-only keys: `[admin] min-permission` and `[exemptions] bypass-min-permission` stand in for the permission nodes
-`combatlog.admin` and `combatlog.bypass` (both default to operators). The command answers are flat keys in `[command-messages]`
+`ignored-worlds` and `command-restrictions` sit under `[combat-log]` as in the original (root-level keys of older files
+still load). `[admin] min-permission` and `[exemptions] bypass-min-permission` are the default operator levels of the
+permission nodes `combatlog.admin` and `combatlog.bypass`; grant the nodes through a permission mod for single players. The command answers are flat keys in `[command-messages]`
 (the original's `commands.combatlog.*` paths, same texts).
 
 The shipped defaults differ from the values the original ran with on its server: there elytra, the ender pearl trigger,
@@ -72,9 +78,7 @@ values into its config. Note: the shipped default of anti-kill-abuse is enabled 
 - Mending is simply disabled, without damage.
 - Death on logout happens at the moment of logout (`player_logging_out`, hooks-all); on an engine without that hook it
   falls back to the next join.
-- Operators are exempt (the original's `combatlog.bypass` defaults to operators).
-- 0.2.0: the riptide cooldown applies only with `riptide-stop` on (the original's documentation does not say what the
-  cooldown does on its own); a stopped riptide is ended by a teleport to where it started.
+- A stopped riptide is ended by a teleport to where it started.
 - The original checks anti-kill-abuse every 25 seconds; this port checks at each kill.
 - 0.2.0: `/combatlog status` always answers "no" for the combat zone and WorldGuard (neither exists in this port);
   `/combatlog reload` reads `config/combatlog-common.toml` at once (the file watcher also does within a second).
@@ -88,9 +92,8 @@ values into its config. Note: the shipped default of anti-kill-abuse is enabled 
 - **WorldGuard safe-zone barriers** and the region-entry refusal: there is no WorldGuard on Horizon to ask for regions;
   a port of it would have to offer a "region at this position" query first.
 - **PlaceholderAPI** placeholders: no placeholder service on Horizon.
-- The explosion trigger (`combat-log.triggers.explosions.set-combat-on-explosion`, `true` in the shipped config): the damage
-  hook names the causing entity, not whether it was an end crystal or a block explosion. Not ported yet.
-- `commands.combatlog.no-permission`: the engine refuses `/combatlog` to non-operators itself; the original's message is not sent.
+- The explosion trigger for **end crystals**: the damage hook gives an entity id, not its type, so only block explosions
+  and respawn anchors tag. Gliding is not stopped on a tag.
 - The AFK title (`afk-title`): it belongs to an AFK plugin's state, which Horizon has no hook for.
 
 ## Build
@@ -109,8 +112,11 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 
 - Mending cannot be refused in combat (`restrictions.mending.disabled_in_combat` is not applied): arismoko moved Mending to an item part a trait mod cannot veto.
 - A refused elytra glide cannot be stopped; the player only gets the message and the penalty.
-- There is no hook before a player leaves, so a tagged logout is punished after they left: the kill waits for their next join, the commands and the announcement run at once.
+- There is no hook before a player leaves in the pinned SDK, so a tagged logout is punished after they left: the kill waits for their next join, the commands and the announcement run at once. With the cargo feature `horizon_player_leaving` (needs the `player_leaving` hook, horizon-rust/horizon#18762) the kill, the commands and the announcement happen at the quit.
 - Hits that the health check or invulnerability left at zero are not heard.
+- A firework boost while elytra is disabled gets the message and the penalty, but cannot be refused.
+- Anti-kill-abuse counts a kill when a hit of the killer on the victim was heard in the last 5 seconds (the death hook names no killer).
+- Portals are refused as teleports when the engine's cause for the travel says `portal` (unverified); written blind. End crystal blasts tag like block explosions (also written blind).
 
 ## Licence and origin
 
