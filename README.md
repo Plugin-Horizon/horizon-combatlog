@@ -1,5 +1,9 @@
 # horizon-combatlog
 
+## Port status
+
+Compared with CombatLog 1.20 (18c0fd1) (estimate): **83 %** of the original's commands, permissions, config keys, messages and features work today; **88 %** once our open Horizon PRs are merged; the engine and SDK figures are not estimated. Estimated count: ~104/~125 items. Status: not yet compiled after the 2026-11-20 round.
+
 > **Unofficial Rust port of CombatLog for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the CombatLog authors.**
 
 Combat tagging for [Horizon](https://github.com/arismoko/horizon) servers, as a native trait mod
